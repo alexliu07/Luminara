@@ -1,5 +1,6 @@
 mod app;
 mod model;
+mod platform;
 
 use windows_reactor::*;
 

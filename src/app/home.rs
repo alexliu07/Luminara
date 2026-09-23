@@ -1,6 +1,7 @@
 use std::rc::Rc;
 use windows_reactor::*;
 
+use crate::app::card::{media_card, Cover};
 use crate::model::media::MediaItem;
 
 /// 首页:作品封面墙。
@@ -37,37 +38,7 @@ impl Component for Home {
     }
 }
 
-/// 单个作品卡片:封面占位 + 标题 + 作者。
+/// 单个作品卡片:封面 + 标题 + 作者。本期纯色占位;二期按 cover_path 分支 Cover::image。
 fn cover_card(item: &MediaItem) -> View {
-    let (r, g, b) = item.cover_rgb;
-    Border::new()
-        .padding(Thickness::uniform(6.0))
-        .content(
-            Grid::new()
-                .columns([GridLength::Pixel(160.0)])
-                .rows([
-                    GridLength::Pixel(160.0),
-                    GridLength::Auto,
-                    GridLength::Auto,
-                ])
-                .children((
-                    Border::new()
-                        .corner_radius(CornerRadius::uniform(8.0))
-                        .background(Color::rgb(r, g, b))
-                        .grid_row(0),
-                    TextBlock::new()
-                        .text(item.title.clone())
-                        .font_size(15.0)
-                        .font_weight(FontWeight::SEMI_BOLD)
-                        .foreground(ThemeBrush::PrimaryText)
-                        .text_wrapping(TextWrapping::Wrap)
-                        .grid_row(1),
-                    TextBlock::new()
-                        .text(item.creator.clone())
-                        .font_size(12.0)
-                        .foreground(Color::rgb(150, 150, 150))
-                        .text_wrapping(TextWrapping::Wrap)
-                        .grid_row(2),
-                )),
-        )
+    media_card(&item.title, &item.creator, Cover::solid(item.cover_rgb))
 }

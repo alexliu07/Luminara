@@ -5,3 +5,12 @@ edition = "2024"
 
 [dependencies]
 windows-reactor = "0.100"
+# 仅用于文件夹选择框(IFileOpenDialog);与框架无类型互通,独立解析版本即可
+windows = { version = "0.62", default-features = false, features = [
+    "std",
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
