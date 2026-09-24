@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use windows_reactor::*;
 
-use crate::app::card::{media_card, Cover};
+use crate::app::card::{media_card_context, Cover};
 use crate::model::library::MediaLibrary;
 
 #[derive(Clone, PartialEq)]
@@ -9,6 +9,10 @@ pub struct LibraryInput {
     pub libraries: Rc<Vec<MediaLibrary>>,
     /// 菜单项点击(回传 label),由 Root 创建并处理。
     pub on_menu: Callback<String>,
+    /// 点击媒体库卡片进入浏览(回传 library id)。
+    pub on_open: Callback<u64>,
+    /// 右键媒体库卡片弹出菜单(回传 library id + 光标窗口坐标)。
+    pub on_context: Callback<(u64, f64, f64)>,
 }
 
 /// 媒体库页:已添加的本地文件夹卡片 + 「添加媒体库」菜单。
@@ -48,9 +52,24 @@ impl Component for Library {
         let grid = GridView::new().collection_slot(
             GridViewSlot::Items,
             input.libraries.iter().map(|lib| {
+                let on_open = input.on_open.clone();
+                let on_context = input.on_context.clone();
+                let id = lib.id;
+                let on_click = move || {
+                    let _ = on_open.call(id);
+                };
+                let on_right = move |(x, y): (f64, f64)| {
+                    let _ = on_context.call((id, x, y));
+                };
                 KeyedView::new(
                     lib.id,
-                    media_card(&lib.name, &lib.path, Cover::folder(lib.cover_rgb)),
+                    media_card_context(
+                        &lib.name,
+                        &lib.path,
+                        Cover::folder(lib.cover_rgb),
+                        on_click,
+                        on_right,
+                    ),
                 )
             }),
         );

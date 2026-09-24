@@ -52,35 +52,82 @@ const ICON_OPACITY: f64 = 0.85;
 
 /// 作品/媒体库通用卡片:封面 + 标题 + 副标题。
 pub fn media_card(title: &str, subtitle: &str, cover: Cover) -> View {
-    Border::new()
-        .padding(Thickness::uniform(6.0))
-        .content(
-            Grid::new()
-                .columns([GridLength::Pixel(149.0)])
-                .rows([
-                    GridLength::Pixel(223.0),
-                    GridLength::Pixel(20.0),
-                    GridLength::Pixel(16.0),
-                ])
-                .children((
-                    cover_block(cover),
-                    TextBlock::new()
-                        .text(title)
-                        .font_size(15.0)
-                        .font_weight(FontWeight::SEMI_BOLD)
-                        .foreground(ThemeBrush::PrimaryText)
-                        .max_lines(1)
-                        .text_trimming(TextTrimming::CharacterEllipsis)
-                        .grid_row(1),
-                    TextBlock::new()
-                        .text(subtitle)
-                        .font_size(12.0)
-                        .foreground(Color::rgb(150, 150, 150))
-                        .max_lines(1)
-                        .text_trimming(TextTrimming::CharacterEllipsis)
-                        .grid_row(2),
-                )),
-        )
+    card_base().content(card_grid(title, subtitle, cover))
+}
+
+/// 可点击卡片:视觉与 media_card 一致,点击触发 on_click。
+/// 外层 Border 设透明背景保证整卡命中,不改变外观。
+pub fn media_card_action(
+    title: &str,
+    subtitle: &str,
+    cover: Cover,
+    on_click: impl IntoUnitCallback,
+) -> View {
+    let cb = on_click.into_unit_callback();
+    card_base()
+        .background(Color::argb(0, 0, 0, 0))
+        .on_pointer_released(move |_info: PointerEventInfo| {
+            let _ = cb.call(());
+        })
+        .content(card_grid(title, subtitle, cover))
+}
+
+/// 可点击卡片 + 右键回调:左键释放触发 on_click,右键按下触发 on_context(带窗口坐标,供菜单定位)。
+/// 右键松开也会触发 on_click(释放事件分不出键),由上层在菜单打开期间忽略打开消息兜底。
+pub fn media_card_context(
+    title: &str,
+    subtitle: &str,
+    cover: Cover,
+    on_click: impl IntoUnitCallback,
+    on_context: impl IntoPayloadCallback<(f64, f64)>,
+) -> View {
+    let click_cb = on_click.into_unit_callback();
+    let context_cb = on_context.into_payload_callback();
+    card_base()
+        .background(Color::argb(0, 0, 0, 0))
+        .on_pointer_pressed(move |info: PointerEventInfo| {
+            if info.is_right_button_pressed {
+                let _ = context_cb.call((info.window_x, info.window_y));
+            }
+        })
+        .on_pointer_released(move |_info: PointerEventInfo| {
+            let _ = click_cb.call(());
+        })
+        .content(card_grid(title, subtitle, cover))
+}
+
+/// 卡片外层 Border:padding 6;事件/背景须在 .content() 前挂上(content 是终端方法)。
+fn card_base() -> Border {
+    Border::new().padding(Thickness::uniform(6.0))
+}
+
+/// 卡片内容 Grid:封面 + 标题 + 副标题。
+fn card_grid(title: &str, subtitle: &str, cover: Cover) -> View {
+    Grid::new()
+        .columns([GridLength::Pixel(149.0)])
+        .rows([
+            GridLength::Pixel(223.0),
+            GridLength::Pixel(20.0),
+            GridLength::Pixel(16.0),
+        ])
+        .children((
+            cover_block(cover),
+            TextBlock::new()
+                .text(title)
+                .font_size(15.0)
+                .font_weight(FontWeight::SEMI_BOLD)
+                .foreground(ThemeBrush::PrimaryText)
+                .max_lines(1)
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .grid_row(1),
+            TextBlock::new()
+                .text(subtitle)
+                .font_size(12.0)
+                .foreground(Color::rgb(150, 150, 150))
+                .max_lines(1)
+                .text_trimming(TextTrimming::CharacterEllipsis)
+                .grid_row(2),
+        ))
 }
 
 /// 封面块:圆角 8 的 Border(回退底色) + 按 Cover 分支填充 content。已带 grid_row(0)。

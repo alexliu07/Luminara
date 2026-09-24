@@ -1,3 +1,6 @@
+use std::fs;
+use std::path::PathBuf;
+
 /// 一个已添加的媒体库(本地文件夹)。纯数据层,不依赖 UI。
 #[derive(Clone, Debug, PartialEq)]
 pub struct MediaLibrary {
@@ -38,4 +41,41 @@ fn cover_rgb_for(path: &str) -> (u8, u8, u8) {
     // 各通道取哈希不同字节段,映射到与示例封面同风格的暗色区间 (30–130)
     let channel = |shift: u32| 30 + ((hash >> shift) as u8 % 101);
     (channel(0), channel(8), channel(16))
+}
+
+/// 加载已保存的媒体库列表;文件缺失或行解析失败跳过该行。
+/// 行格式:`id;path`(名称/封面色由 path 派生,不持久化)。
+pub fn load_libraries() -> Vec<MediaLibrary> {
+    let Ok(text) = fs::read_to_string(libraries_path()) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (id, path) = line.split_once(';')?;
+            let id: u64 = id.parse().ok()?;
+            Some(MediaLibrary::from_path(id, path.to_string()))
+        })
+        .collect()
+}
+
+/// 写入媒体库列表;失败静默(本地缓存不阻断交互)。
+pub fn save_libraries(libraries: &[MediaLibrary]) {
+    let path = libraries_path();
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let text: String = libraries
+        .iter()
+        .map(|lib| format!("{};{}\n", lib.id, lib.path))
+        .collect();
+    let _ = fs::write(path, text);
+}
+
+/// 媒体库列表文件路径:%APPDATA%\Luminara\libraries.txt。
+fn libraries_path() -> PathBuf {
+    std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Luminara")
+        .join("libraries.txt")
 }
