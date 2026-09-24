@@ -1,0 +1,1 @@
+IMFDXGIDeviceManager: windows_core::Param<windows_core::IUnknown, windows_core::InterfaceType>

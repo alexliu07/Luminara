@@ -5,7 +5,7 @@ edition = "2024"
 
 [dependencies]
 windows-reactor = "0.100"
-# 仅用于文件夹选择框(IFileOpenDialog);与框架无类型互通,独立解析版本即可
+# 仅用于 Win32/WinRT 互操作(文件夹选择框、Media Foundation 播放内核);与框架无类型互通,独立解析版本即可
 windows = { version = "0.62", default-features = false, features = [
     "std",
     "Win32_Foundation",
@@ -13,4 +13,15 @@ windows = { version = "0.62", default-features = false, features = [
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Media_MediaFoundation",
 ] }
+# windows 0.62 同版 windows-core:#[implement] 宏展开走 ::windows_core:: 路径,必须对上 0.62 系
+windows-core = "0.62.2"
+# 框架 windows-reactor 的 IUnknown 在 0.100 系 windows-core 里;换个 crate 名并存两版
+wr-core = { package = "windows-core", version = "0.100" }
