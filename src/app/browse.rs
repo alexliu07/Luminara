@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use windows_reactor::*;
 
-use crate::app::card::{media_card_action, Cover};
+use crate::app::card::{Cover, media_card_action};
+use crate::model::format;
 
 /// 浏览页的一个条目(文件或子目录)。
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,8 @@ pub struct BrowseInput {
     pub entries: Rc<Vec<BrowseEntry>>,
     /// 点击子目录卡片进入。
     pub on_enter: Callback<PathBuf>,
+    /// 点击受支持的媒体文件,打开播放页。
+    pub on_open_file: Callback<PathBuf>,
     /// 返回上一级;在根目录时退回媒体库列表。
     pub on_back: Callback<()>,
 }
@@ -50,7 +53,11 @@ impl Component for BrowsePage {
             .foreground(ThemeBrush::PrimaryText);
 
         // 标题行:根目录显示「返回媒体库」;子目录显示「返回上一级」。
-        let back_label = if input.at_root { "返回媒体库" } else { "返回上一级" };
+        let back_label = if input.at_root {
+            "返回媒体库"
+        } else {
+            "返回上一级"
+        };
         let title_row = StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(12.0)
@@ -87,10 +94,20 @@ impl Component for BrowsePage {
                     Callback::new(move |()| {
                         let _ = on_enter.call(path.clone());
                     })
+                } else if format::is_supported(&entry.name) {
+                    // 受支持的媒体文件 → 播放页;其余文件点了没反应。
+                    let on_open = input.on_open_file.clone();
+                    let path = entry.path.clone();
+                    Callback::new(move |()| {
+                        let _ = on_open.call(path.clone());
+                    })
                 } else {
                     Callback::new(|()| {})
                 };
-                KeyedView::new(i, media_card_action(&entry.name, &subtitle, cover, on_click))
+                KeyedView::new(
+                    i,
+                    media_card_action(&entry.name, &subtitle, cover, on_click),
+                )
             }),
         );
 
@@ -106,7 +123,9 @@ impl Component for BrowsePage {
                         .foreground(Color::rgb(150, 150, 150)),
                 ))
             } else {
-                StackPanel::new().spacing(16.0).children((title_row, path_hint, grid))
+                StackPanel::new()
+                    .spacing(16.0)
+                    .children((title_row, path_hint, grid))
             })
     }
 }

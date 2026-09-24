@@ -476,6 +476,7 @@ impl Component for Root {
                             at_root: state.current_path == state.root_path,
                             entries: Rc::new(state.entries.clone()),
                             on_enter: context.callback(Message::EnterDir),
+                            on_open_file: context.callback(Message::OpenMediaFile),
                             on_back: context.callback(|_: ()| Message::GoBack),
                         })
                     } else {
