@@ -4,5 +4,6 @@ pub mod home;
 pub mod library;
 pub mod page;
 pub mod placeholder;
+pub mod player;
 pub mod root;
 pub mod settings;

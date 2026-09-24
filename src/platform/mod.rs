@@ -6,7 +6,7 @@ pub mod video;
 pub mod window;
 
 pub use dialog::pick_folder;
-pub use player::{PlayerCore, PlayerSnapshot};
+pub use player::PlayerCore;
 pub use window::toggle_fullscreen;
 
 /// windows 0.62 的 IUnknown → 框架 windows-core 0.100 的 IUnknown。

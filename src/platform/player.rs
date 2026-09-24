@@ -9,9 +9,9 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 use windows::Win32::Media::MediaFoundation::{
-    CLSID_MFMediaEngineClassFactory, IMFMediaEngine, IMFMediaEngineClassFactory, IMFMediaEngineNotify,
-    IMFMediaEngineNotify_Impl, MFCreateAttributes, MFCreateDXGIDeviceManager, MFStartup,
-    MFSTARTUP_FULL, MF_MEDIA_ENGINE_CALLBACK, MF_MEDIA_ENGINE_DXGI_MANAGER, MF_VERSION,
+    CLSID_MFMediaEngineClassFactory, IMFMediaEngine, IMFMediaEngineClassFactory,
+    IMFMediaEngineNotify, IMFMediaEngineNotify_Impl, MF_MEDIA_ENGINE_CALLBACK,
+    MF_MEDIA_ENGINE_DXGI_MANAGER, MF_VERSION, MFCreateAttributes, MFSTARTUP_FULL, MFStartup,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoCreateInstance};
 use windows::core::{BSTR, implement};
@@ -189,19 +189,12 @@ impl PlayerCore {
         }
         let host = self.host.as_ref().expect("刚初始化过");
         unsafe {
-            let mut token = 0u32;
-            let mut manager = None;
-            MFCreateDXGIDeviceManager(&mut token, &mut manager).map_err(err_text)?;
-            let manager = manager.ok_or_else(|| "创建 DXGI 设备管理器失败".to_string())?;
-            manager
-                .ResetDevice(host.device(), token)
-                .map_err(err_text)?;
-
             let mut attributes = None;
             MFCreateAttributes(&mut attributes, 2).map_err(err_text)?;
             let attributes = attributes.ok_or_else(|| "创建媒体引擎属性失败".to_string())?;
+            // 解码输出经 VideoHost 的 DXGI 设备管理器落到我们的 D3D 设备。
             attributes
-                .SetUnknown(&MF_MEDIA_ENGINE_DXGI_MANAGER, &manager)
+                .SetUnknown(&MF_MEDIA_ENGINE_DXGI_MANAGER, host.device_manager())
                 .map_err(err_text)?;
             let notify: IMFMediaEngineNotify = EngineNotify.into();
             attributes

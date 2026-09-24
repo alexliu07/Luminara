@@ -89,10 +89,6 @@ impl VideoHost {
         }
     }
 
-    pub fn device(&self) -> &ID3D11Device {
-        &self.device
-    }
-
     pub fn device_manager(&self) -> &IMFDXGIDeviceManager {
         &self.device_manager
     }
