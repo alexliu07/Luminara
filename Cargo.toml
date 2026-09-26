@@ -3,14 +3,34 @@ name = "Luminara"
 version = "0.1.0"
 edition = "2024"
 
+# 字幕解析/栅格化:纯 Rust,不依赖 Windows;模型层与字幕引擎可在任意平台编译与测试
 [dependencies]
+oxideav-subtitle = "0.1"
+oxideav-ass = "0.0"
+oxideav-scribe = "0.1"
+libbitsub-core = "1.12"
+png = "0.17"
+
+# Windows 专属依赖;Linux 下只编译模型层与字幕引擎(便于跑单测)
+[target.'cfg(windows)'.dependencies]
 windows-reactor = "0.100"
-# 仅用于 Win32/WinRT 互操作(文件夹选择框);与框架无类型互通,独立解析版本即可
+# 仅用于 Win32/WinRT 互操作(文件夹选择框、D3D11/交换链、全屏、GL 装载);与框架无类型互通,独立解析版本即可
 windows = { version = "0.62", default-features = false, features = [
     "std",
     "Win32_Foundation",
     "Win32_System_Com",
+    "Win32_System_LibraryLoader",
     "Win32_UI_Shell",
     "Win32_UI_Shell_Common",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
+# 框架 windows-reactor 的 IUnknown 在 0.100 系 windows-core 里;换个 crate 名并存两版
+wr-core = { package = "windows-core", version = "0.100" }
+# 播放内核:libmpv 2.x 活跃 fork,自带 OpenGL render 实现;GPLv2+,发行随包携带 mpv-2.dll
+libmpv2 = "6"
