@@ -185,56 +185,181 @@ fn load_face(path: &Path) -> Option<Face> {
 }
 
 // ---------------------------------------------------------------------------
-// 图形字幕:libbitsub-core(PGS / VobSub)——M5 实现
+// 图形字幕:libbitsub-core(PGS / VobSub)
 // ---------------------------------------------------------------------------
 
 struct PgsEngine {
-    path: PathBuf,
+    parser: libbitsub_core::PgsParser,
     canvas: (u32, u32),
+    active: Option<u64>,
+    started: bool,
 }
 
 impl PgsEngine {
     fn open(path: &Path, canvas: (u32, u32)) -> Result<Self, String> {
+        let bytes = std::fs::read(path).map_err(|error| format!("读 PGS 失败: {error}"))?;
+        let mut parser = libbitsub_core::PgsParser::new();
+        parser.parse(&bytes);
+        if parser.count() == 0 {
+            return Err("PGS 无字幕".to_string());
+        }
         Ok(Self {
-            path: path.to_path_buf(),
+            parser,
             canvas,
+            active: None,
+            started: false,
         })
     }
 }
 
 impl SubtitleEngine for PgsEngine {
     fn cue_count(&self) -> usize {
-        0
+        self.parser.count()
     }
 
-    fn render_at(&mut self, _time: f64) -> CueRender {
-        let _ = (&self.path, self.canvas);
-        CueRender::Update(None)
+    fn render_at(&mut self, time: f64) -> CueRender {
+        let time_ms = time * 1000.0;
+        let index = self.parser.find_index_at_timestamp(time_ms);
+        // PGS 的 find 只找「起始点之前最近一条」,越界要靠终点兜住。
+        let active = (index >= 0 && time_ms < self.parser.get_cue_end_time(index as usize))
+            .then_some(index as u64);
+        if active == self.active && self.started {
+            return CueRender::Unchanged;
+        }
+        self.started = true;
+        self.active = active;
+        let Some(index) = active else {
+            return CueRender::Update(None);
+        };
+        // EMPTY_CUE(空组合对象=擦除)渲染返回 None,按清屏处理。
+        let Some(frame) = self.parser.render_at_index(index as usize) else {
+            return CueRender::Update(None);
+        };
+        let screen = (frame.width(), frame.height());
+        let mut rgba = vec![0u8; (self.canvas.0 * self.canvas.1 * 4) as usize];
+        for slot in 0..frame.composition_count() {
+            let Some(comp) = frame.get_composition(slot) else {
+                continue;
+            };
+            blit_rect(
+                &mut rgba,
+                self.canvas,
+                screen,
+                (comp.x(), comp.y(), comp.width(), comp.height()),
+                comp.get_rgba(),
+            );
+        }
+        CueRender::Update(Some(SubtitleOverlay {
+            cue_id: index,
+            rgba,
+            width: self.canvas.0,
+            height: self.canvas.1,
+        }))
     }
 }
 
 struct VobSubEngine {
-    path: PathBuf,
+    parser: libbitsub_core::VobSubParser,
     canvas: (u32, u32),
+    active: Option<u64>,
+    started: bool,
 }
 
 impl VobSubEngine {
+    /// .sub 为主体;.idx 可选(同名),没有就用无 idx 模式解析。
     fn open(path: &Path, canvas: (u32, u32)) -> Result<Self, String> {
+        let sub_data = std::fs::read(path).map_err(|error| format!("读 VobSub 失败: {error}"))?;
+        let mut parser = libbitsub_core::VobSubParser::new();
+        match std::fs::read_to_string(subtitle::vobsub_idx(path)) {
+            Ok(idx) => parser.load_from_data(&idx, sub_data),
+            Err(_) => parser.load_from_sub_only(sub_data),
+        }
+        if parser.count() == 0 {
+            return Err("VobSub 无字幕".to_string());
+        }
         Ok(Self {
-            path: path.to_path_buf(),
+            parser,
             canvas,
+            active: None,
+            started: false,
         })
     }
 }
 
 impl SubtitleEngine for VobSubEngine {
     fn cue_count(&self) -> usize {
-        0
+        self.parser.count()
     }
 
-    fn render_at(&mut self, _time: f64) -> CueRender {
-        let _ = (&self.path, self.canvas);
-        CueRender::Update(None)
+    fn render_at(&mut self, time: f64) -> CueRender {
+        let time_ms = time * 1000.0;
+        // VobSub 的 find 自带起止判定,域外返回 -1。
+        let index = self.parser.find_index_at_timestamp(time_ms);
+        let active = (index >= 0).then_some(index as u64);
+        if active == self.active && self.started {
+            return CueRender::Unchanged;
+        }
+        self.started = true;
+        self.active = active;
+        let Some(index) = active else {
+            return CueRender::Update(None);
+        };
+        let Some(frame) = self.parser.render_at_index(index as usize) else {
+            return CueRender::Update(None);
+        };
+        let screen = (frame.screen_width(), frame.screen_height());
+        let mut rgba = vec![0u8; (self.canvas.0 * self.canvas.1 * 4) as usize];
+        blit_rect(
+            &mut rgba,
+            self.canvas,
+            screen,
+            (frame.x(), frame.y(), frame.width(), frame.height()),
+            frame.get_rgba(),
+        );
+        CueRender::Update(Some(SubtitleOverlay {
+            cue_id: index,
+            rgba,
+            width: self.canvas.0,
+            height: self.canvas.1,
+        }))
+    }
+}
+
+/// 字幕矩形合成到画布:按屏幕→画布等比映射,最近邻缩放,直接拷 RGBA。
+/// 画布全透明打底,位图字幕自带直通 alpha,拷贝即合成。
+fn blit_rect(
+    dst: &mut [u8],
+    canvas: (u32, u32),
+    screen: (u16, u16),
+    rect: (u16, u16, u16, u16),
+    rgba: &[u8],
+) {
+    let (canvas_w, canvas_h) = (canvas.0 as usize, canvas.1 as usize);
+    let (screen_w, screen_h) = (screen.0.max(1) as usize, screen.1.max(1) as usize);
+    let (rect_x, rect_y, rect_w, rect_h) = (
+        rect.0 as usize,
+        rect.1 as usize,
+        rect.2 as usize,
+        rect.3 as usize,
+    );
+    if rect_w == 0 || rect_h == 0 {
+        return;
+    }
+    // 目标矩形 = 屏幕坐标等比映射到画布。
+    let dx0 = rect_x * canvas_w / screen_w;
+    let dy0 = rect_y * canvas_h / screen_h;
+    let dx1 = (rect_x + rect_w) * canvas_w / screen_w;
+    let dy1 = (rect_y + rect_h) * canvas_h / screen_h;
+    for dy in dy0..dy1.min(canvas_h) {
+        let sy = (dy - dy0) * rect_h / (dy1 - dy0).max(1);
+        for dx in dx0..dx1.min(canvas_w) {
+            let sx = (dx - dx0) * rect_w / (dx1 - dx0).max(1);
+            let src = (sy * rect_w + sx) * 4;
+            let dst_at = (dy * canvas_w + dx) * 4;
+            if src + 4 <= rgba.len() && dst_at + 4 <= dst.len() {
+                dst[dst_at..dst_at + 4].copy_from_slice(&rgba[src..src + 4]);
+            }
+        }
     }
 }
 
@@ -443,6 +568,60 @@ mod tests {
         assert!(cleared.is_some_and(|out| out.png.is_none()));
 
         drop(worker);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn 位图矩形合成() {
+        // 2x2 红块 1:1 拷进 4x4 画布右下。
+        let mut canvas = vec![0u8; 4 * 4 * 4];
+        let rgba = [255u8, 0, 0, 255].repeat(4);
+        blit_rect(&mut canvas, (4, 4), (4, 4), (2, 2, 2, 2), &rgba);
+        let at = (2 * 4 + 2) * 4;
+        assert_eq!(&canvas[at..at + 4], &[255, 0, 0, 255][..]);
+        assert_eq!(&canvas[..4], &[0, 0, 0, 0][..]);
+
+        // 屏幕 8x8 的 (0,0,4,4) 映射到画布 4x4,盖住 (0,0,1,1) 两行两列。
+        let mut canvas = vec![0u8; 4 * 4 * 4];
+        blit_rect(&mut canvas, (4, 4), (8, 8), (0, 0, 4, 4), &rgba);
+        assert_eq!(&canvas[..4], &[255, 0, 0, 255][..]);
+        assert_eq!(&canvas[4..8], &[255, 0, 0, 255][..]);
+        assert_eq!(&canvas[8..12], &[0, 0, 0, 0][..]);
+    }
+
+    #[test]
+    fn 图形字幕坏文件报错() {
+        let dir = std::env::temp_dir().join(format!("luminara-gfx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pgs = dir.join("a.sup");
+        let vob = dir.join("b.sub");
+        std::fs::write(&pgs, b"not a pgs stream").unwrap();
+        std::fs::write(&vob, b"not a vobsub stream").unwrap();
+
+        // 解析出 0 条字幕 → 打开失败(Root 拿到错误后按无字幕处理)。
+        assert!(
+            open_engine(
+                &SubtitleFile {
+                    path: pgs,
+                    label: "a".into(),
+                    kind: SubtitleKind::Pgs,
+                },
+                (32, 24),
+            )
+            .is_err()
+        );
+        assert!(
+            open_engine(
+                &SubtitleFile {
+                    path: vob,
+                    label: "b".into(),
+                    kind: SubtitleKind::VobSub,
+                },
+                (32, 24),
+            )
+            .is_err()
+        );
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
