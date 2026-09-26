@@ -3,6 +3,7 @@ use std::rc::Rc;
 use windows_reactor::*;
 
 use crate::app::card::{Cover, media_card_action};
+use crate::model::format;
 
 /// 浏览页的一个条目(文件或子目录)。
 #[derive(Clone, Debug, PartialEq)]
@@ -25,6 +26,8 @@ pub struct BrowseInput {
     pub entries: Rc<Vec<BrowseEntry>>,
     /// 点击子目录卡片进入。
     pub on_enter: Callback<PathBuf>,
+    /// 点击受支持的媒体文件卡片(进播放页);其余文件不回传。
+    pub on_open: Callback<PathBuf>,
     /// 返回上一级;在根目录时退回媒体库列表。
     pub on_back: Callback<()>,
 }
@@ -91,8 +94,14 @@ impl Component for BrowsePage {
                     Callback::new(move |()| {
                         let _ = on_enter.call(path.clone());
                     })
+                } else if format::is_supported(&entry.name) {
+                    // 受支持媒体文件 → 进播放页;字幕等其余文件显示但点击不响应。
+                    let on_open = input.on_open.clone();
+                    let path = entry.path.clone();
+                    Callback::new(move |()| {
+                        let _ = on_open.call(path.clone());
+                    })
                 } else {
-                    // 文件点击暂无动作,待新播放器实现接入。
                     Callback::new(|()| {})
                 };
                 KeyedView::new(

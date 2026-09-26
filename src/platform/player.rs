@@ -16,9 +16,9 @@ use std::thread::JoinHandle;
 
 use libmpv2::events::{Event, PropertyData};
 use libmpv2::render::{OpenGLInitParams, RenderContext, RenderParam, RenderParamApiType};
-use libmpv2::{mpv_end_file_reason, Format, Mpv};
+use libmpv2::{Format, Mpv, mpv_end_file_reason};
 
-use super::video::{gl_get_proc_address, GlLoader};
+use super::video::{GlLoader, gl_get_proc_address};
 
 /// 播放状态快照:UI 轮询取用,驱动进度条、连播与字幕。
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -253,7 +253,9 @@ impl PlayerCore {
             .mpv
             .create_render_context(params)
             .map_err(|error| format!("mpv render 上下文创建失败: {error}"))?;
-        self.render = Some(unsafe { std::mem::transmute::<RenderContext<'_>, RenderContext<'static>>(render) });
+        self.render = Some(unsafe {
+            std::mem::transmute::<RenderContext<'_>, RenderContext<'static>>(render)
+        });
         Ok(())
     }
 
@@ -290,9 +292,7 @@ fn event_loop(client: Mpv, shared: Arc<Shared>, shutdown: Arc<AtomicBool>) {
             continue;
         };
         match event {
-            Event::PropertyChange {
-                name, change, ..
-            } => match (name, change) {
+            Event::PropertyChange { name, change, .. } => match (name, change) {
                 ("time-pos", PropertyData::Double(value)) => {
                     if value.is_finite() {
                         snap.position = value;

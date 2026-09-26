@@ -60,9 +60,13 @@ impl Component for SettingsPage {
             .padding(Thickness::uniform(24.0))
             // 刮削模式开启时才显示 TMDB API Key 输入框。
             .content(if input.scrape_mode {
-                StackPanel::new().spacing(16.0).children((title, scrape_row, api_key_row))
+                StackPanel::new()
+                    .spacing(16.0)
+                    .children((title, scrape_row, api_key_row))
             } else {
-                StackPanel::new().spacing(16.0).children((title, scrape_row))
+                StackPanel::new()
+                    .spacing(16.0)
+                    .children((title, scrape_row))
             })
     }
 }

@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use windows_reactor::*;
 
-use crate::app::card::{media_card, Cover};
+use crate::app::card::{Cover, media_card};
 use crate::model::media::MediaItem;
 
 /// 首页输入:作品列表 + 是否正在后台扫描索引。
@@ -56,14 +56,12 @@ impl Component for Home {
             Grid::new().columns([GridLength::STAR]).children((title,))
         };
 
-        Border::new()
-            .padding(Thickness::uniform(24.0))
-            .content(
-                StackPanel::new().spacing(16.0).children((
-                    title_row,
-                    GridView::new().collection_slot(GridViewSlot::Items, cards),
-                )),
-            )
+        Border::new().padding(Thickness::uniform(24.0)).content(
+            StackPanel::new().spacing(16.0).children((
+                title_row,
+                GridView::new().collection_slot(GridViewSlot::Items, cards),
+            )),
+        )
     }
 }
 

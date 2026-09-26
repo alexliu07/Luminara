@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::time::Duration;
@@ -5,10 +6,13 @@ use windows_reactor::*;
 
 use crate::app::browse::{BrowseEntry, BrowseInput, BrowsePage};
 use crate::app::home::{Home, HomeInput};
+use crate::app::icon;
 use crate::app::library::{Library, LibraryInput};
 use crate::app::page::Page;
 use crate::app::placeholder::Placeholder;
+use crate::app::player::{PlayerInput, PlayerPage, VideoPanelRef};
 use crate::app::settings::{SettingsInput, SettingsPage};
+use crate::model::format;
 use crate::model::index;
 use crate::model::library::{self, MediaLibrary};
 use crate::model::media::{self, MediaItem};
@@ -31,6 +35,32 @@ struct ContextMenuState {
     shown: bool,
 }
 
+/// 播放状态:播放列表(同级文件)+ 进度快照。播放器页本身无状态。
+struct PlayState {
+    /// 同目录受支持文件(按文件名序),上一个/下一个按它切换。
+    playlist: Vec<PathBuf>,
+    index: usize,
+    /// 当前位置 / 总时长(秒)。
+    position: f64,
+    duration: f64,
+    paused: bool,
+    /// 是否有视频流(纯音频显示占位)。
+    has_video: bool,
+    /// 播到片尾(防自动切曲重入)。
+    ended: bool,
+    error: Option<String>,
+    /// 拖动进度条期间的临时位置;引擎追上前压过轮询值,防滑块回跳。
+    scrub: Option<f64>,
+    /// 进度条拖动中(拖动只更新 UI,松手一次 seek)。
+    dragging: bool,
+    /// 全屏中。
+    fullscreen: bool,
+    /// 顶底栏可见(全屏闲置隐藏、鼠标移动唤回)。
+    chrome_visible: bool,
+    /// 画面区上次点击时刻(毫秒,UNIX 纪元);双击=400ms 内两次。
+    last_press_ms: i64,
+}
+
 pub struct Root {
     page: Page,
     library: Rc<Vec<MediaItem>>,
@@ -48,6 +78,19 @@ pub struct Root {
     pending_remove: Option<(u64, String)>,
     /// 右键菜单;Some 时显示菜单浮层。
     context_menu: Option<ContextMenuState>,
+    /// 播放状态;Some 时显示播放器页(压过普通页面)。
+    player: Option<PlayState>,
+    /// 播放内核(mpv);Rc<RefCell> 与面板 Rendering 回调共享。None = 初始化失败。
+    player_core: Rc<RefCell<Option<platform::PlayerCore>>>,
+    /// 视频输出(D3D11 交换链 + GL);与 Rendering 回调共享。
+    video_host: Rc<RefCell<Option<platform::VideoHost>>>,
+    /// 视频面板引用(SwapChainPanel 挂交换链用)。
+    video_ref: VideoPanelRef,
+    /// 面板 Metrics/Rendering 观察句柄;必须保活,掉了回调就停(只取 Drop 语义)。
+    #[allow(dead_code)]
+    video_obs: Option<ElementObservation>,
+    /// 播放内核/视频输出初始化失败文案;打开文件时显示在画面区。
+    video_init_error: Option<String>,
 }
 
 pub enum Message {
@@ -75,6 +118,36 @@ pub enum Message {
     CloseContextMenu,
     /// 移除确认对话框关闭(回传按钮结果)。
     RemoveDialogClosed(ContentDialogResult),
+    /// 打开媒体文件播放(浏览页点击回传路径)。
+    OpenMediaFile(PathBuf),
+    /// 播放器:切换播放/暂停。
+    PlayerTogglePause,
+    /// 播放器:快进/快退(秒,可负)。
+    PlayerSeekBy(f64),
+    /// 进度条拖动开始(压住引擎位置显示)。
+    PlayerScrubStart,
+    /// 进度条拖动中(回传秒;只更新 UI)。
+    PlayerScrub(f64),
+    /// 进度条松手(提交一次 seek)。
+    PlayerScrubCommit,
+    /// 播放器:上一个。
+    PlayerPrev,
+    /// 播放器:下一个。
+    PlayerNext,
+    /// 播放器:切换全屏。
+    PlayerFullscreen,
+    /// 点击画面区(双击判定 → 切全屏)。
+    PlayerVideoPress,
+    /// 鼠标在画面区移动(唤回顶底栏)。
+    PlayerChromeShow,
+    /// 全屏闲置隐藏顶底栏(自续定时器回执)。
+    PlayerChromeHide,
+    /// 播放页快捷键(空格/Esc/左右)。
+    PlayerKey(platform::KeyAction),
+    /// 播放器:退出播放,回到浏览。
+    PlayerExit,
+    /// 播放进度轮询(自续定时器回执)。
+    PlayerTick,
 }
 
 impl Component for Root {
@@ -89,6 +162,80 @@ impl Component for Root {
         for lib in &libraries {
             Self::spawn_index_build(context, lib.id, PathBuf::from(&lib.path));
         }
+        // 播放内核与视频输出:Rendering/Metrics 回调直接驱动渲染,不经消息泵。
+        let player_core = Rc::new(RefCell::new(None));
+        let video_host = Rc::new(RefCell::new(None));
+        let mut video_init_error = None;
+        let mut core_slot = match platform::PlayerCore::new() {
+            Ok(core) => Some(core),
+            Err(error) => {
+                video_init_error = Some(error);
+                None
+            }
+        };
+        let mut host_slot = match platform::VideoHost::new() {
+            Ok(host) => Some(host),
+            Err(error) => {
+                if video_init_error.is_none() {
+                    video_init_error = Some(error);
+                }
+                None
+            }
+        };
+        if let (Some(core), Some(host)) = (core_slot.as_mut(), host_slot.as_mut()) {
+            match host.init_gl() {
+                Ok(loader) => {
+                    if let Err(error) = core.init_video(loader) {
+                        video_init_error = Some(error);
+                    }
+                }
+                Err(error) => {
+                    // GL(ANGLE)不可用:音频仍可播,画面区显示错误文案。
+                    video_init_error = Some(error);
+                }
+            }
+        }
+        *player_core.borrow_mut() = core_slot;
+        *video_host.borrow_mut() = host_slot;
+        let video_ref = VideoPanelRef(Rc::new(ElementRef::<SwapChainPanel>::new()));
+        let video_obs = {
+            let host_slot = Rc::clone(&video_host);
+            let core_slot = Rc::clone(&player_core);
+            let panel = Rc::clone(&video_ref.0);
+            video_ref.0.observe_surface(move |event| match event {
+                SwapChainPanelEvent::Metrics {
+                    width,
+                    height,
+                    scale_x,
+                    scale_y,
+                } => {
+                    let w = (width * scale_x as f64).round().max(1.0) as u32;
+                    let h = (height * scale_y as f64).round().max(1.0) as u32;
+                    if let Some(host) = host_slot.borrow_mut().as_mut() {
+                        if let Some(swap_chain) = host.resize(w, h) {
+                            // 挂接被拒(面板还没发布)就留着 needs_attach,下次 Metrics 重试。
+                            let attached = panel.request_set_swap_chain(
+                                platform::to_framework_unknown(&swap_chain),
+                                |_| {},
+                            );
+                            if attached {
+                                host.set_attached();
+                            }
+                        }
+                    }
+                }
+                // 每个合成帧一拍:有新帧就渲染进交换链呈现。
+                SwapChainPanelEvent::Rendering => {
+                    let mut host_slot = host_slot.borrow_mut();
+                    let mut core_slot = core_slot.borrow_mut();
+                    if let (Some(host), Some(core)) = (host_slot.as_mut(), core_slot.as_mut()) {
+                        if core.render_dirty() || host.dirty() {
+                            let _ = host.present(|w, h| core.render_frame(w, h));
+                        }
+                    }
+                }
+            })
+        };
         Self {
             page: Page::Home,
             library: Rc::new(media::sample_library()),
@@ -100,6 +247,12 @@ impl Component for Root {
             scans_in_flight,
             pending_remove: None,
             context_menu: None,
+            player: None,
+            player_core,
+            video_host,
+            video_ref,
+            video_obs: Some(video_obs),
+            video_init_error,
         }
     }
 
@@ -109,6 +262,8 @@ impl Component for Root {
                 if let Some(page) = tag.as_deref().and_then(Page::from_tag) {
                     self.page = page;
                 }
+                // 导航切换顺带退出播放,免得播放器压住新页面。
+                self.exit_player();
             }
             Message::PaneOpenChanged(open) => self.pane_open = open,
             Message::MenuInvoked(label) => {
@@ -200,6 +355,128 @@ impl Component for Root {
                     }
                 }
             }
+            Message::OpenMediaFile(path) => {
+                // 播放页快捷键钩子:首次打开时装上,之后只开关激活位。
+                Self::ensure_key_hook(context);
+                platform::set_key_active(true);
+                self.start_playback(path);
+                Self::arm_tick(context);
+            }
+            Message::PlayerTogglePause => {
+                if let Some(core) = self.player_core.borrow_mut().as_mut() {
+                    core.toggle_pause();
+                }
+                self.refresh_snapshot();
+            }
+            Message::PlayerSeekBy(delta) => {
+                if let Some(core) = self.player_core.borrow_mut().as_mut() {
+                    core.seek_by(delta);
+                }
+                if let Some(state) = &mut self.player {
+                    state.ended = false;
+                    state.scrub = None;
+                }
+                self.refresh_snapshot();
+            }
+            Message::PlayerScrubStart => {
+                if let Some(state) = &mut self.player {
+                    state.dragging = true;
+                }
+            }
+            Message::PlayerScrub(time) => {
+                // 拖动中只更新 UI;echo(自身 value 写回)在非拖动态直接忽略。
+                if let Some(state) = &mut self.player {
+                    if state.dragging {
+                        state.scrub = Some(time);
+                    }
+                }
+            }
+            Message::PlayerScrubCommit => {
+                if let Some(state) = &mut self.player {
+                    state.dragging = false;
+                    if let Some(target) = state.scrub.take() {
+                        if let Some(core) = self.player_core.borrow_mut().as_mut() {
+                            core.seek_to(target);
+                        }
+                        if let Some(state) = &mut self.player {
+                            state.position = target;
+                            state.ended = false;
+                        }
+                    }
+                }
+            }
+            Message::PlayerExit => self.exit_player(),
+            Message::PlayerPrev => self.switch_track(-1),
+            Message::PlayerNext => self.switch_track(1),
+            Message::PlayerFullscreen => self.toggle_fullscreen_state(),
+            Message::PlayerVideoPress => {
+                let now = now_ms();
+                let mut double_click = false;
+                if let Some(state) = &mut self.player {
+                    if now - state.last_press_ms <= 400 {
+                        state.last_press_ms = 0;
+                        double_click = true;
+                    } else {
+                        state.last_press_ms = now;
+                    }
+                }
+                if double_click {
+                    self.toggle_fullscreen_state();
+                }
+            }
+            Message::PlayerChromeShow => {
+                if let Some(state) = &mut self.player {
+                    state.chrome_visible = true;
+                }
+                Self::arm_chrome_hide(context);
+            }
+            Message::PlayerChromeHide => {
+                // 只在全屏且没被中途退出时隐藏。
+                if let Some(state) = &mut self.player {
+                    if state.fullscreen {
+                        state.chrome_visible = false;
+                    }
+                }
+            }
+            Message::PlayerKey(action) => match action {
+                platform::KeyAction::TogglePause => {
+                    if let Some(core) = self.player_core.borrow_mut().as_mut() {
+                        core.toggle_pause();
+                    }
+                    self.refresh_snapshot();
+                }
+                platform::KeyAction::Escape => {
+                    if self.player.as_ref().is_some_and(|state| state.fullscreen) {
+                        self.toggle_fullscreen_state();
+                    } else {
+                        self.exit_player();
+                    }
+                }
+                platform::KeyAction::SeekBack => {
+                    if let Some(core) = self.player_core.borrow_mut().as_mut() {
+                        core.seek_by(-10.0);
+                    }
+                    if let Some(state) = &mut self.player {
+                        state.ended = false;
+                        state.scrub = None;
+                    }
+                }
+                platform::KeyAction::SeekForward => {
+                    if let Some(core) = self.player_core.borrow_mut().as_mut() {
+                        core.seek_by(10.0);
+                    }
+                    if let Some(state) = &mut self.player {
+                        state.ended = false;
+                        state.scrub = None;
+                    }
+                }
+            },
+            Message::PlayerTick => {
+                self.refresh_snapshot();
+                if self.player.is_some() {
+                    Self::arm_tick(context);
+                }
+            }
         }
     }
 
@@ -218,53 +495,89 @@ impl Component for Root {
                     .tag(page.tag())
                     .is_selected(page == self.page)
                     .slots([
-                        SlotView::new(
-                            NavigationViewItemSlot::Icon,
-                            SymbolIcon::new().symbol(page.icon()),
-                        ),
+                        SlotView::new(NavigationViewItemSlot::Icon, icon::path_icon(page.icon())),
                         SlotView::new(NavigationViewItemSlot::Content, page.title()),
                     ]),
             )
         });
 
-        let content = match self.page {
-            Page::Home => View::component::<Home>(HomeInput {
-                items: Rc::clone(&self.library),
-                scanning: self.scans_in_flight > 0,
-            }),
-            Page::Library => {
-                if let Some(state) = &self.browse {
-                    let dir_name = state
-                        .current_path
-                        .file_name()
-                        .map(|n| n.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| state.current_path.to_string_lossy().into_owned());
-                    View::component::<BrowsePage>(BrowseInput {
-                        dir_name,
-                        dir_path: state.current_path.to_string_lossy().into_owned(),
-                        at_root: state.current_path == state.root_path,
-                        entries: Rc::new(state.entries.clone()),
-                        on_enter: context.callback(Message::EnterDir),
-                        on_back: context.callback(|_: ()| Message::GoBack),
-                    })
-                } else {
-                    View::component::<Library>(LibraryInput {
-                        libraries: Rc::clone(&self.libraries),
-                        on_menu: context.callback(Message::MenuInvoked),
-                        on_open: context.callback(Message::OpenLibrary),
-                        on_context: context.callback(|(id, x, y): (u64, f64, f64)| {
-                            Message::OpenContextMenu(id, x, y)
-                        }),
-                    })
+        // 播放中压过普通页面;返回即回浏览现场(browse 状态未动)。
+        let content = if let Some(state) = &self.player {
+            let path = &state.playlist[state.index];
+            let title = path
+                .file_stem()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let error = state
+                .error
+                .clone()
+                .or_else(|| self.video_init_error.clone());
+            View::component::<PlayerPage>(PlayerInput {
+                title,
+                position: state.position,
+                duration: state.duration,
+                paused: state.paused,
+                has_video: state.has_video,
+                error,
+                scrub: state.scrub,
+                fullscreen: state.fullscreen,
+                chrome_visible: state.chrome_visible,
+                at_first: state.index == 0,
+                at_last: state.index + 1 >= state.playlist.len(),
+                video_ref: self.video_ref.clone(),
+                on_back: context.callback(|_: ()| Message::PlayerExit),
+                on_toggle_pause: context.callback(|_: ()| Message::PlayerTogglePause),
+                on_seek_by: context.callback(Message::PlayerSeekBy),
+                on_scrub_start: context.callback(|_: ()| Message::PlayerScrubStart),
+                on_scrub: context.callback(Message::PlayerScrub),
+                on_scrub_commit: context.callback(|_: ()| Message::PlayerScrubCommit),
+                on_prev: context.callback(|_: ()| Message::PlayerPrev),
+                on_next: context.callback(|_: ()| Message::PlayerNext),
+                on_fullscreen: context.callback(|_: ()| Message::PlayerFullscreen),
+                on_video_press: context.callback(|_: ()| Message::PlayerVideoPress),
+                on_pointer_moved: context.callback(|_: ()| Message::PlayerChromeShow),
+            })
+        } else {
+            match self.page {
+                Page::Home => View::component::<Home>(HomeInput {
+                    items: Rc::clone(&self.library),
+                    scanning: self.scans_in_flight > 0,
+                }),
+                Page::Library => {
+                    if let Some(state) = &self.browse {
+                        let dir_name = state
+                            .current_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| state.current_path.to_string_lossy().into_owned());
+                        View::component::<BrowsePage>(BrowseInput {
+                            dir_name,
+                            dir_path: state.current_path.to_string_lossy().into_owned(),
+                            at_root: state.current_path == state.root_path,
+                            entries: Rc::new(state.entries.clone()),
+                            on_enter: context.callback(Message::EnterDir),
+                            on_open: context.callback(Message::OpenMediaFile),
+                            on_back: context.callback(|_: ()| Message::GoBack),
+                        })
+                    } else {
+                        View::component::<Library>(LibraryInput {
+                            libraries: Rc::clone(&self.libraries),
+                            on_menu: context.callback(Message::MenuInvoked),
+                            on_open: context.callback(Message::OpenLibrary),
+                            on_context: context.callback(|(id, x, y): (u64, f64, f64)| {
+                                Message::OpenContextMenu(id, x, y)
+                            }),
+                        })
+                    }
                 }
+                Page::Settings => View::component::<SettingsPage>(SettingsInput {
+                    scrape_mode: self.settings.scrape_mode,
+                    tmdb_api_key: self.settings.tmdb_api_key.clone(),
+                    on_scrape_changed: context.callback(Message::ScrapeChanged),
+                    on_api_key_changed: context.callback(Message::ApiKeyChanged),
+                }),
+                other => View::component::<Placeholder>(other),
             }
-            Page::Settings => View::component::<SettingsPage>(SettingsInput {
-                scrape_mode: self.settings.scrape_mode,
-                tmdb_api_key: self.settings.tmdb_api_key.clone(),
-                on_scrape_changed: context.callback(Message::ScrapeChanged),
-                on_api_key_changed: context.callback(Message::ApiKeyChanged),
-            }),
-            other => View::component::<Placeholder>(other),
         };
 
         let shell = NavigationView::new()
@@ -323,6 +636,175 @@ impl Component for Root {
 }
 
 impl Root {
+    /// 打开媒体文件:建播放列表(同级受支持文件按名序)并起播。
+    fn start_playback(&mut self, path: PathBuf) {
+        let playlist = format::collect_siblings(&path);
+        let Some(index) = playlist.iter().position(|p| p == &path) else {
+            return;
+        };
+        self.player = Some(PlayState {
+            playlist,
+            index,
+            position: 0.0,
+            duration: 0.0,
+            paused: false,
+            has_video: false,
+            ended: false,
+            error: None,
+            scrub: None,
+            dragging: false,
+            fullscreen: self.player.as_ref().is_some_and(|p| p.fullscreen),
+            chrome_visible: true,
+            last_press_ms: 0,
+        });
+        self.open_track();
+    }
+
+    /// 切到当前 index 的曲目:重置快照,交给内核。
+    fn open_track(&mut self) {
+        let Some(state) = &mut self.player else {
+            return;
+        };
+        let path = state.playlist[state.index].clone();
+        state.position = 0.0;
+        state.duration = 0.0;
+        state.paused = false;
+        state.has_video = false;
+        state.ended = false;
+        state.error = None;
+        state.scrub = None;
+        if let Some(core) = self.player_core.borrow_mut().as_mut() {
+            if let Err(error) = core.open(&path) {
+                if let Some(state) = &mut self.player {
+                    state.error = Some(error);
+                }
+            }
+        } else if let Some(state) = &mut self.player {
+            state.error = self.video_init_error.clone();
+        }
+    }
+
+    /// 上一个/下一个:在同级文件列表内移动,到头/到尾不动。
+    fn switch_track(&mut self, delta: i64) {
+        let Some(state) = &mut self.player else {
+            return;
+        };
+        let next = state.index as i64 + delta;
+        if !(0..state.playlist.len() as i64).contains(&next) {
+            return;
+        }
+        state.index = next as usize;
+        self.open_track();
+    }
+
+    /// 切换全屏;退出全屏顺带把顶底栏唤回。
+    fn toggle_fullscreen_state(&mut self) {
+        let fullscreen = platform::toggle_fullscreen();
+        if let Some(state) = &mut self.player {
+            state.fullscreen = fullscreen;
+            state.chrome_visible = true;
+        }
+    }
+
+    /// 退出播放:停内核、退全屏、关播放器页。
+    fn exit_player(&mut self) {
+        if self.player.is_none() {
+            return;
+        }
+        if let Some(core) = self.player_core.borrow_mut().as_mut() {
+            core.stop();
+        }
+        if self.player.as_ref().is_some_and(|state| state.fullscreen) {
+            platform::toggle_fullscreen();
+        }
+        platform::set_key_active(false);
+        self.player = None;
+    }
+
+    /// 轮询内核快照:更新进度/状态。
+    fn refresh_snapshot(&mut self) {
+        let core_guard = self.player_core.borrow();
+        let Some(core) = core_guard.as_ref() else {
+            return;
+        };
+        let snapshot = core.snapshot();
+        drop(core_guard);
+        let Some(state) = &mut self.player else {
+            return;
+        };
+        state.has_video = snapshot.has_video;
+        state.paused = snapshot.paused;
+        state.duration = snapshot.duration;
+        state.error = if snapshot.error {
+            Some("无法播放该文件。".to_string())
+        } else {
+            None
+        };
+        // 拖动进度条时引擎位置还没追上目标,继续压住显示,防滑块回跳。
+        match state.scrub {
+            Some(target) if !state.dragging && (snapshot.position - target).abs() >= 0.75 => {
+                state.position = target;
+            }
+            Some(_) if state.dragging => {}
+            _ => {
+                state.scrub = None;
+                state.position = snapshot.position;
+            }
+        }
+        // eof 自动连播:切下一个;到底则停在片尾。
+        let mut advance = false;
+        if snapshot.ended && !snapshot.error {
+            if !state.ended {
+                state.ended = true;
+                advance = state.index + 1 < state.playlist.len();
+                if advance {
+                    state.index += 1;
+                }
+            }
+        } else {
+            state.ended = false;
+        }
+        if advance {
+            self.open_track();
+        }
+    }
+
+    /// 250ms 自续定时器:spawn_background 回一条 PlayerTick,收尾再派下一个。
+    /// 坑:框架没有 interval API,LocalSender 是 Rc 派的(非 Send),后台线程不能直接发消息,
+    /// 只能靠这条「完成回执」接力驱动进度轮询。
+    fn arm_tick(context: &ComponentContext<Self>) {
+        context.spawn_background(|token| {
+            for _ in 0..10 {
+                if token.is_cancelled() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Message::PlayerTick
+        });
+    }
+
+    /// 2.5s 自续定时器:全屏鼠标移动后延时隐藏顶底栏。
+    fn arm_chrome_hide(context: &ComponentContext<Self>) {
+        context.spawn_background(|token| {
+            for _ in 0..250 {
+                if token.is_cancelled() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Message::PlayerChromeHide
+        });
+    }
+
+    /// 首次进播放页时装按键钩子(幂等);回调回投 PlayerKey。
+    fn ensure_key_hook(context: &ComponentContext<Self>) {
+        let callback = context.sender().callback(Message::PlayerKey);
+        platform::install_key_hook(Box::new(move |action| {
+            let _ = callback.call(action);
+        }));
+    }
+
     /// 弹系统文件夹选择框,选中的文件夹按路径去重后加入媒体库;取消或重复则无变化。
     /// 选择框模态自带消息循环,update 内同步调用安全(LocalSender 队列化投递)。
     /// 添加后后台线程扫描目录树并持久化索引。
@@ -401,6 +883,14 @@ fn context_menu_overlay(
                 .margin(Thickness::new(state.x, state.y, 0.0, 0.0))
                 .content(StackPanel::new().spacing(2.0).children(buttons)),
         ))
+}
+
+/// 当前时刻(毫秒,UNIX 纪元)。双击判定用。
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// 读取一个目录的条目(子目录 + 文件),排序:目录在前、文件在后,各按名称。

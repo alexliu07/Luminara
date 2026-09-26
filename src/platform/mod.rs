@@ -15,7 +15,9 @@ pub use dialog::pick_folder;
 #[cfg(windows)]
 pub use player::PlayerCore;
 #[cfg(windows)]
-pub use window::toggle_fullscreen;
+pub use video::VideoHost;
+#[cfg(windows)]
+pub use window::{KeyAction, install_key_hook, set_key_active, toggle_fullscreen};
 
 /// windows 0.62 的 IUnknown → 框架 windows-core 0.100 的 IUnknown。
 ///

@@ -24,7 +24,7 @@ pub fn build(root: &Path) -> Vec<IndexEntry> {
 
 fn walk(dir: &Path, prefix: &str, out: &mut Vec<IndexEntry>) {
     let Ok(read_dir) = fs::read_dir(dir) else {
-        return
+        return;
     };
     for item in read_dir.flatten() {
         let name = item.file_name().to_string_lossy().into_owned();
@@ -33,9 +33,7 @@ fn walk(dir: &Path, prefix: &str, out: &mut Vec<IndexEntry>) {
         } else {
             format!("{prefix}/{name}")
         };
-        let Ok(meta) = item.metadata() else {
-            continue
-        };
+        let Ok(meta) = item.metadata() else { continue };
         let is_dir = meta.is_dir();
         out.push(IndexEntry {
             rel_path: rel_path.clone(),

@@ -1,8 +1,10 @@
 pub mod browse;
 pub mod card;
 pub mod home;
+pub mod icon;
 pub mod library;
 pub mod page;
 pub mod placeholder;
+pub mod player;
 pub mod root;
 pub mod settings;

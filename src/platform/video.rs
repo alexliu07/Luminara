@@ -12,7 +12,7 @@
 //!
 //! 未在 Windows 实测:ANGLE DLL 的装载、FBO 渲染、行序(见 flip_rows 注释)。
 
-use std::ffi::{c_char, c_void, CString};
+use std::ffi::{CString, c_char, c_void};
 use std::ptr;
 
 use windows::Win32::Foundation::HMODULE;
@@ -80,17 +80,11 @@ const GL_FRAMEBUFFER_COMPLETE: u32 = 0x8CD5;
 type FnGetDisplay = unsafe extern "system" fn(*mut c_void) -> EglDisplay;
 type FnInitialize = unsafe extern "system" fn(EglDisplay, *mut i32, *mut i32) -> u32;
 type FnBindApi = unsafe extern "system" fn(u32) -> u32;
-type FnChooseConfig = unsafe extern "system" fn(
-    EglDisplay,
-    *const i32,
-    *mut EglConfig,
-    i32,
-    *mut i32,
-) -> u32;
+type FnChooseConfig =
+    unsafe extern "system" fn(EglDisplay, *const i32, *mut EglConfig, i32, *mut i32) -> u32;
 type FnCreateContext =
     unsafe extern "system" fn(EglDisplay, EglConfig, EglContext, *const i32) -> EglContext;
-type FnCreatePbuffer =
-    unsafe extern "system" fn(EglDisplay, EglConfig, *const i32) -> EglSurface;
+type FnCreatePbuffer = unsafe extern "system" fn(EglDisplay, EglConfig, *const i32) -> EglSurface;
 type FnMakeCurrent =
     unsafe extern "system" fn(EglDisplay, EglSurface, EglSurface, EglContext) -> u32;
 type FnGetProc = unsafe extern "system" fn(*const c_char) -> *mut c_void;
@@ -179,8 +173,7 @@ impl GlSurface {
                 transmute_proc(get_proc_address(loader._egl, "eglGetDisplay"))?;
             let initialize: FnInitialize =
                 transmute_proc(get_proc_address(loader._egl, "eglInitialize"))?;
-            let bind_api: FnBindApi =
-                transmute_proc(get_proc_address(loader._egl, "eglBindAPI"))?;
+            let bind_api: FnBindApi = transmute_proc(get_proc_address(loader._egl, "eglBindAPI"))?;
             let choose_config: FnChooseConfig =
                 transmute_proc(get_proc_address(loader._egl, "eglChooseConfig"))?;
             let create_context: FnCreateContext =
@@ -311,7 +304,8 @@ impl GlSurface {
             self.fbo = fbo;
             self.rbo = rbo;
             self.size = (width, height);
-            self.readback.resize(width as usize * height as usize * 4, 0);
+            self.readback
+                .resize(width as usize * height as usize * 4, 0);
         }
         Ok(())
     }
@@ -369,6 +363,8 @@ pub struct VideoHost {
     size_px: (u32, u32),
     /// 交换链新建/重建后还没挂到面板;挂上前不呈现。
     needs_attach: bool,
+    /// 画面需要重绘(尺寸变化/刚创建);呈现一次后清掉。
+    dirty: bool,
     gl: Option<GlSurface>,
 }
 
@@ -399,9 +395,15 @@ impl VideoHost {
                 swapchain: None,
                 size_px: (0, 0),
                 needs_attach: false,
+                dirty: true,
                 gl: None,
             })
         }
+    }
+
+    /// 画面是否需要强制重绘(尺寸变化/刚创建)。
+    pub fn dirty(&self) -> bool {
+        self.dirty
     }
 
     /// 初始化 GL 渲染面;返回 mpv 用的装载器。
@@ -438,6 +440,7 @@ impl VideoHost {
         if !resized && self.recreate_swapchain().is_err() {
             return None;
         }
+        self.dirty = true;
         if self.needs_attach {
             self.attach_handle()
         } else {
@@ -522,6 +525,7 @@ impl VideoHost {
                 .ok()
                 .map_err(err_text)?;
         }
+        self.dirty = false;
         Ok(())
     }
 }

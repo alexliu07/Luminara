@@ -1,7 +1,7 @@
 use std::rc::Rc;
 use windows_reactor::*;
 
-use crate::app::card::{media_card_context, Cover};
+use crate::app::card::{Cover, media_card_context};
 use crate::model::library::MediaLibrary;
 
 #[derive(Clone, PartialEq)]
@@ -86,9 +86,7 @@ impl Component for Library {
                     grid,
                 ))
             } else {
-                StackPanel::new()
-                    .spacing(16.0)
-                    .children((title_row, grid))
+                StackPanel::new().spacing(16.0).children((title_row, grid))
             })
     }
 }

@@ -1,4 +1,4 @@
-use windows_reactor::Symbol;
+use crate::app::icon::Icon;
 
 /// 侧边栏导航的页面。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -10,12 +10,7 @@ pub enum Page {
 }
 
 impl Page {
-    pub const ALL: [Page; 4] = [
-        Page::Home,
-        Page::Library,
-        Page::Playlists,
-        Page::Settings,
-    ];
+    pub const ALL: [Page; 4] = [Page::Home, Page::Library, Page::Playlists, Page::Settings];
 
     /// NavigationView 选中回调按 tag 路由。
     pub fn from_tag(tag: &str) -> Option<Self> {
@@ -46,12 +41,13 @@ impl Page {
         }
     }
 
-    pub fn icon(self) -> Symbol {
+    /// 手绘 SVG 图标(见 icon.rs;不用 emoji/图标字体)。
+    pub fn icon(self) -> Icon {
         match self {
-            Self::Home => Symbol::Home,
-            Self::Library => Symbol::MusicInfo,
-            Self::Playlists => Symbol::List,
-            Self::Settings => Symbol::Setting,
+            Self::Home => Icon::Home,
+            Self::Library => Icon::Library,
+            Self::Playlists => Icon::Playlists,
+            Self::Settings => Icon::Settings,
         }
     }
 }
