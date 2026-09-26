@@ -5,6 +5,7 @@
 pub mod dialog;
 #[cfg(windows)]
 pub mod player;
+pub mod subtitle;
 #[cfg(windows)]
 pub mod video;
 #[cfg(windows)]

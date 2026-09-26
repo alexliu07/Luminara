@@ -3,6 +3,8 @@
 //! 文案全部极简;图标全部手绘(见 icon.rs)。
 
 use std::rc::Rc;
+use std::sync::Arc;
+use std::time::Duration;
 use windows_reactor::*;
 
 use crate::app::icon::{self, Icon};
@@ -14,6 +16,16 @@ pub struct VideoPanelRef(pub Rc<ElementRef<SwapChainPanel>>);
 impl PartialEq for VideoPanelRef {
     fn eq(&self, other: &Self) -> bool {
         Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// 字幕覆盖层(PNG 编码的 RGBA 帧)。按指针比较:内容动辄几 MB,不能逐字节比。
+#[derive(Clone)]
+pub struct OverlayImage(pub Arc<[u8]>);
+
+impl PartialEq for OverlayImage {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }
 
@@ -41,6 +53,14 @@ pub struct PlayerInput {
     /// 播放列表到头/到尾(禁用上一个/下一个)。
     pub at_first: bool,
     pub at_last: bool,
+    /// 字幕轨标签(内嵌在前、外挂在后),下标即选择值。
+    pub subtitle_labels: Rc<Vec<String>>,
+    /// 当前字幕选择;None = 关闭。
+    pub subtitle_selected: Option<usize>,
+    /// 字幕菜单是否展开。
+    pub subtitle_menu_open: bool,
+    /// 外挂自绘覆盖层(PNG);内嵌轨由 mpv 渲染,无此项。
+    pub overlay: Option<OverlayImage>,
     pub video_ref: VideoPanelRef,
     pub on_back: Callback<()>,
     pub on_toggle_pause: Callback<()>,
@@ -55,6 +75,11 @@ pub struct PlayerInput {
     pub on_prev: Callback<()>,
     pub on_next: Callback<()>,
     pub on_fullscreen: Callback<()>,
+    /// 字幕菜单开/关。
+    pub on_subtitle_menu: Callback<()>,
+    /// 选字幕轨;None = 关闭字幕。
+    pub on_subtitle_select: Callback<Option<usize>>,
+    pub on_close_subtitle_menu: Callback<()>,
     /// 点击画面(双击判定在 Root:400ms 内两次=切全屏)。
     pub on_video_press: Callback<()>,
     /// 鼠标在画面区移动(唤回顶底栏)。
@@ -89,13 +114,33 @@ impl Component for PlayerPage {
                     .text_trimming(TextTrimming::CharacterEllipsis),
             ));
 
-        // 画面区:SwapChainPanel 打底,提示叠同一格(Grid 兄弟叠层不占布局)。
+        // 画面区:SwapChainPanel 打底,外挂字幕覆盖层与提示叠同一格
+        // (Grid 兄弟叠层不占布局)。内嵌字幕由 mpv 渲进画面,无需覆盖层。
         let message = if let Some(error) = &input.error {
             error.clone()
         } else if input.has_video {
             String::new()
         } else {
             "音频".to_string()
+        };
+        let message_text = TextBlock::new()
+            .text(message)
+            .font_size(16.0)
+            .foreground(ThemeBrush::PrimaryText)
+            .horizontal_alignment(HorizontalAlignment::Center)
+            .vertical_alignment(VerticalAlignment::Center);
+        let video_grid = match &input.overlay {
+            Some(overlay) => Grid::new().children((
+                SwapChainPanel::new().element_ref(&input.video_ref.0),
+                Image::new()
+                    .source_data(EncodedImage::new(Arc::clone(&overlay.0)))
+                    .stretch(Stretch::Fill),
+                message_text,
+            )),
+            None => Grid::new().children((
+                SwapChainPanel::new().element_ref(&input.video_ref.0),
+                message_text,
+            )),
         };
         let video_area = Border::new()
             .corner_radius(CornerRadius::uniform(8.0))
@@ -113,17 +158,7 @@ impl Component for PlayerPage {
                     let _ = on_moved.call(());
                 }
             })
-            .content(
-                Grid::new().children((
-                    SwapChainPanel::new().element_ref(&input.video_ref.0),
-                    TextBlock::new()
-                        .text(message)
-                        .font_size(16.0)
-                        .foreground(ThemeBrush::PrimaryText)
-                        .horizontal_alignment(HorizontalAlignment::Center)
-                        .vertical_alignment(VerticalAlignment::Center),
-                )),
-            );
+            .content(video_grid);
 
         // 进度行:当前时间 + 进度条 + 总时长。拖动只更新 UI,松手才 seek。
         let shown = input.scrub.unwrap_or(input.position);
@@ -155,7 +190,7 @@ impl Component for PlayerPage {
                 time_label(input.duration),
             ));
 
-        // 控制行:上一个 快退 播放/暂停 快进 下一个 全屏。
+        // 控制行:上一个 快退 播放/暂停 快进 下一个 全屏 字幕。
         let controls = StackPanel::new()
             .orientation(Orientation::Horizontal)
             .spacing(8.0)
@@ -183,6 +218,16 @@ impl Component for PlayerPage {
                     input.on_fullscreen.clone(),
                     true,
                 ),
+                icon_button(
+                    Icon::Subtitles,
+                    Callback::new({
+                        let on_menu = input.on_subtitle_menu.clone();
+                        move |()| {
+                            let _ = on_menu.call(());
+                        }
+                    }),
+                    true,
+                ),
             ]);
 
         let bottom = StackPanel::new()
@@ -198,7 +243,12 @@ impl Component for PlayerPage {
                 video_area,
                 chrome_slot(input.chrome_visible, bottom.into()),
             ));
-        content
+
+        if input.subtitle_menu_open {
+            Grid::new().children((content, subtitle_menu(input)))
+        } else {
+            content
+        }
     }
 }
 
@@ -253,4 +303,57 @@ fn format_time(seconds: f64) -> String {
     } else {
         format!("{m:02}:{s:02}")
     }
+}
+
+/// 字幕选择菜单:透明捕获层(点空白关闭)+ 右下角菜单卡片。选中项用 Accent 高亮。
+fn subtitle_menu(input: &PlayerInput) -> View {
+    let mut options: Vec<(Option<usize>, String)> = vec![(None, "关闭".to_string())];
+    options.extend(
+        input
+            .subtitle_labels
+            .iter()
+            .enumerate()
+            .map(|(index, label)| (Some(index), label.clone())),
+    );
+    // 选项数不定,children 只收定长,借 ListBox 的 collection_slot 收迭代器。
+    let rows = options
+        .into_iter()
+        .enumerate()
+        .map(|(key, (value, label))| KeyedView::new(key, subtitle_item(&label, value, input)));
+    Grid::new()
+        // 关闭时整层移除,借退出过渡淡出。
+        .exit_transition(ExitTransition::fade(Duration::from_millis(150)))
+        .children((
+            Border::new()
+                .background(Color::argb(1, 0, 0, 0))
+                .on_pointer_released({
+                    let on_close = input.on_close_subtitle_menu.clone();
+                    move |_info: PointerEventInfo| {
+                        let _ = on_close.call(());
+                    }
+                }),
+            Border::new()
+                .horizontal_alignment(HorizontalAlignment::Right)
+                .vertical_alignment(VerticalAlignment::Bottom)
+                .corner_radius(CornerRadius::uniform(8.0))
+                .background(Color::rgb(40, 40, 40))
+                .padding(Thickness::uniform(4.0))
+                .margin(Thickness::new(0.0, 0.0, 24.0, 24.0))
+                .content(ListBox::new().collection_slot(ListBoxSlot::Items, rows)),
+        ))
+}
+
+/// 字幕菜单一项。
+fn subtitle_item(label: &str, value: Option<usize>, input: &PlayerInput) -> View {
+    let on_select = input.on_subtitle_select.clone();
+    Button::new()
+        .style(if input.subtitle_selected == value {
+            ButtonStyle::Accent
+        } else {
+            ButtonStyle::Default
+        })
+        .on_click(move || {
+            let _ = on_select.call(value);
+        })
+        .content(label)
 }

@@ -10,14 +10,16 @@ use crate::app::icon;
 use crate::app::library::{Library, LibraryInput};
 use crate::app::page::Page;
 use crate::app::placeholder::Placeholder;
-use crate::app::player::{PlayerInput, PlayerPage, VideoPanelRef};
+use crate::app::player::{OverlayImage, PlayerInput, PlayerPage, VideoPanelRef};
 use crate::app::settings::{SettingsInput, SettingsPage};
 use crate::model::format;
 use crate::model::index;
 use crate::model::library::{self, MediaLibrary};
 use crate::model::media::{self, MediaItem};
 use crate::model::settings::Settings;
+use crate::model::subtitle::{self as submodel, SubtitleFile};
 use crate::platform;
+use crate::platform::subtitle::SubtitleWorker;
 
 /// 浏览状态:记录当前浏览的媒体库及目录位置。
 struct BrowseState {
@@ -59,6 +61,93 @@ struct PlayState {
     chrome_visible: bool,
     /// 画面区上次点击时刻(毫秒,UNIX 纪元);双击=400ms 内两次。
     last_press_ms: i64,
+    /// 字幕状态(菜单两类轨、选择、自绘覆盖层)。
+    subtitle: SubtitleState,
+}
+
+/// 字幕选择值(重建菜单后仍能对上原选择)。
+#[derive(Clone, PartialEq)]
+enum SubtitleChoice {
+    /// 内嵌轨(mpv 原生渲染)。
+    Embedded(i64),
+    /// 外挂字幕文件(自绘管线)。
+    External(PathBuf),
+}
+
+/// 字幕状态。同一时刻只开一个字幕来源:
+/// 选内嵌 → mpv sid 切换、自绘线程停;选外挂 → sid=no、自绘线程接管。
+struct SubtitleState {
+    /// 内嵌轨(sid, 标签)。
+    embedded: Rc<Vec<(i64, String)>>,
+    /// 外挂字幕文件(同名发现)。
+    external: Rc<Vec<SubtitleFile>>,
+    selected: Option<SubtitleChoice>,
+    menu_open: bool,
+    /// 外挂自绘覆盖层(PNG);内嵌轨由 mpv 渲染,此值恒 None。
+    overlay: Option<OverlayImage>,
+    /// 已见过的 track-list 版本;变了才重建内嵌轨列表。
+    tracks_seen: u64,
+    /// 覆盖层产出版本号(去重,只认更新的)。
+    revision: u64,
+}
+
+impl SubtitleState {
+    /// 打开文件时的初值:外挂字幕同名发现,内嵌轨等 track-list 就绪再补。
+    fn for_media(path: &PathBuf) -> Self {
+        Self {
+            embedded: Rc::new(Vec::new()),
+            external: Rc::new(submodel::discover(path)),
+            selected: None,
+            menu_open: false,
+            overlay: None,
+            tracks_seen: 0,
+            revision: 0,
+        }
+    }
+
+    /// 菜单标签:内嵌在前(语言/序号),外挂在后(文件名)。
+    fn labels(&self) -> Rc<Vec<String>> {
+        let mut labels: Vec<String> = self
+            .embedded
+            .iter()
+            .map(|(_, label)| label.clone())
+            .collect();
+        labels.extend(self.external.iter().map(|file| file.label.clone()));
+        Rc::new(labels)
+    }
+
+    /// 当前选择对应的菜单下标(高亮用)。
+    fn selected_index(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        let offset = self.embedded.len();
+        match selected {
+            SubtitleChoice::Embedded(id) => self.embedded.iter().position(|(sid, _)| sid == id),
+            SubtitleChoice::External(path) => self
+                .external
+                .iter()
+                .position(|file| &file.path == path)
+                .map(|index| index + offset),
+        }
+    }
+
+    /// 菜单下标 → 选择值。
+    fn choice_at(&self, index: usize) -> Option<SubtitleChoice> {
+        if let Some((sid, _)) = self.embedded.get(index) {
+            Some(SubtitleChoice::Embedded(*sid))
+        } else {
+            self.external
+                .get(index - self.embedded.len())
+                .map(|file| SubtitleChoice::External(file.path.clone()))
+        }
+    }
+
+    /// 外挂文件按路径取(交给自绘线程)。
+    fn external_file(&self, path: &PathBuf) -> Option<SubtitleFile> {
+        self.external
+            .iter()
+            .find(|file| &file.path == path)
+            .cloned()
+    }
 }
 
 pub struct Root {
@@ -82,6 +171,8 @@ pub struct Root {
     player: Option<PlayState>,
     /// 播放内核(mpv);Rc<RefCell> 与面板 Rendering 回调共享。None = 初始化失败。
     player_core: Rc<RefCell<Option<platform::PlayerCore>>>,
+    /// 外挂字幕自绘工作线程(解析/栅格化全在后台)。
+    subtitle_worker: SubtitleWorker,
     /// 视频输出(D3D11 交换链 + GL);与 Rendering 回调共享。
     video_host: Rc<RefCell<Option<platform::VideoHost>>>,
     /// 视频面板引用(SwapChainPanel 挂交换链用)。
@@ -142,6 +233,12 @@ pub enum Message {
     PlayerChromeShow,
     /// 全屏闲置隐藏顶底栏(自续定时器回执)。
     PlayerChromeHide,
+    /// 字幕菜单开/关。
+    SubtitleMenuToggle,
+    /// 关闭字幕菜单(点空白处)。
+    SubtitleMenuClose,
+    /// 选字幕轨(菜单下标);None = 关闭字幕。
+    SubtitleSelect(Option<usize>),
     /// 播放页快捷键(空格/Esc/左右)。
     PlayerKey(platform::KeyAction),
     /// 播放器:退出播放,回到浏览。
@@ -197,6 +294,13 @@ impl Component for Root {
         }
         *player_core.borrow_mut() = core_slot;
         *video_host.borrow_mut() = host_slot;
+        // 字幕工作线程的时间源:mpv 事件线程写的 time-pos 原子位模式。
+        // 内核没起来就给个哑时钟,反正也不会有播放。
+        let time_bits = player_core
+            .borrow()
+            .as_ref()
+            .map(|core| core.time_bits())
+            .unwrap_or_default();
         let video_ref = VideoPanelRef(Rc::new(ElementRef::<SwapChainPanel>::new()));
         let video_obs = {
             let host_slot = Rc::clone(&video_host);
@@ -249,6 +353,7 @@ impl Component for Root {
             context_menu: None,
             player: None,
             player_core,
+            subtitle_worker: SubtitleWorker::new(time_bits),
             video_host,
             video_ref,
             video_obs: Some(video_obs),
@@ -408,6 +513,17 @@ impl Component for Root {
             Message::PlayerExit => self.exit_player(),
             Message::PlayerPrev => self.switch_track(-1),
             Message::PlayerNext => self.switch_track(1),
+            Message::SubtitleMenuToggle => {
+                if let Some(state) = &mut self.player {
+                    state.subtitle.menu_open = !state.subtitle.menu_open;
+                }
+            }
+            Message::SubtitleMenuClose => {
+                if let Some(state) = &mut self.player {
+                    state.subtitle.menu_open = false;
+                }
+            }
+            Message::SubtitleSelect(index) => self.select_subtitle(index),
             Message::PlayerFullscreen => self.toggle_fullscreen_state(),
             Message::PlayerVideoPress => {
                 let now = now_ms();
@@ -473,6 +589,7 @@ impl Component for Root {
             },
             Message::PlayerTick => {
                 self.refresh_snapshot();
+                self.drain_subtitle_out();
                 if self.player.is_some() {
                     Self::arm_tick(context);
                 }
@@ -524,6 +641,10 @@ impl Component for Root {
                 chrome_visible: state.chrome_visible,
                 at_first: state.index == 0,
                 at_last: state.index + 1 >= state.playlist.len(),
+                subtitle_labels: state.subtitle.labels(),
+                subtitle_selected: state.subtitle.selected_index(),
+                subtitle_menu_open: state.subtitle.menu_open,
+                overlay: state.subtitle.overlay.clone(),
                 video_ref: self.video_ref.clone(),
                 on_back: context.callback(|_: ()| Message::PlayerExit),
                 on_toggle_pause: context.callback(|_: ()| Message::PlayerTogglePause),
@@ -534,6 +655,9 @@ impl Component for Root {
                 on_prev: context.callback(|_: ()| Message::PlayerPrev),
                 on_next: context.callback(|_: ()| Message::PlayerNext),
                 on_fullscreen: context.callback(|_: ()| Message::PlayerFullscreen),
+                on_subtitle_menu: context.callback(|_: ()| Message::SubtitleMenuToggle),
+                on_subtitle_select: context.callback(Message::SubtitleSelect),
+                on_close_subtitle_menu: context.callback(|_: ()| Message::SubtitleMenuClose),
                 on_video_press: context.callback(|_: ()| Message::PlayerVideoPress),
                 on_pointer_moved: context.callback(|_: ()| Message::PlayerChromeShow),
             })
@@ -656,6 +780,7 @@ impl Root {
             fullscreen: self.player.as_ref().is_some_and(|p| p.fullscreen),
             chrome_visible: true,
             last_press_ms: 0,
+            subtitle: SubtitleState::for_media(&path),
         });
         self.open_track();
     }
@@ -673,6 +798,9 @@ impl Root {
         state.ended = false;
         state.error = None;
         state.scrub = None;
+        // 字幕随文件走:外挂重新发现,自绘线程先停(不打断播放)。
+        state.subtitle = SubtitleState::for_media(&path);
+        self.subtitle_worker.set_source(None);
         if let Some(core) = self.player_core.borrow_mut().as_mut() {
             if let Err(error) = core.open(&path) {
                 if let Some(state) = &mut self.player {
@@ -706,6 +834,86 @@ impl Root {
         }
     }
 
+    /// 选字幕轨(铁律②:同一时刻只开一个来源)。
+    /// 内嵌 → mpv 原生渲染,自绘线程停;外挂 → sid=no,自绘线程接管。
+    fn select_subtitle(&mut self, index: Option<usize>) {
+        let canvas = self
+            .video_host
+            .borrow()
+            .as_ref()
+            .map(|host| host.size_px())
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .unwrap_or((1280, 720));
+        let Some(state) = &mut self.player else {
+            return;
+        };
+        state.subtitle.menu_open = false;
+        state.subtitle.selected = index.and_then(|index| state.subtitle.choice_at(index));
+        state.subtitle.overlay = None;
+        let mut source = None;
+        let mut sid = None;
+        match &state.subtitle.selected {
+            Some(SubtitleChoice::Embedded(id)) => sid = Some(*id),
+            Some(SubtitleChoice::External(path)) => {
+                source = state
+                    .subtitle
+                    .external_file(path)
+                    .map(|file| (file, canvas));
+            }
+            None => {}
+        }
+        self.subtitle_worker.set_source(source);
+        if let Some(core) = self.player_core.borrow_mut().as_mut() {
+            core.set_sub_track(sid);
+        }
+    }
+
+    /// track-list 变了:重建内嵌轨菜单。
+    /// 用户没选过就如实跟随 mpv 自动选择(它默认会开第一条内嵌轨)。
+    fn rebuild_subtitle_menu(&mut self, version: u64, tracks: Vec<platform::player::SubTrack>) {
+        let Some(state) = &mut self.player else {
+            return;
+        };
+        state.subtitle.tracks_seen = version;
+        let embedded = tracks
+            .iter()
+            .map(|track| {
+                let label = match (track.lang.is_empty(), track.title.is_empty()) {
+                    (false, false) => format!("内嵌 {}({})", track.lang, track.title),
+                    (false, true) => format!("内嵌 {}", track.lang),
+                    (true, false) => format!("内嵌 {}", track.title),
+                    (true, true) => format!("内嵌 #{}", track.id),
+                };
+                (track.id, label)
+            })
+            .collect();
+        let keep = match &state.subtitle.selected {
+            Some(SubtitleChoice::Embedded(id)) => tracks.iter().any(|track| track.id == *id),
+            Some(SubtitleChoice::External(_)) => true,
+            None => false,
+        };
+        state.subtitle.embedded = Rc::new(embedded);
+        if !keep {
+            state.subtitle.selected = tracks
+                .iter()
+                .find(|track| track.selected)
+                .map(|track| SubtitleChoice::Embedded(track.id));
+        }
+    }
+
+    /// 收工作线程的覆盖层产出(只认更新的版本)。
+    fn drain_subtitle_out(&mut self) {
+        let Some(out) = self.subtitle_worker.take_out() else {
+            return;
+        };
+        if let Some(state) = &mut self.player {
+            if state.subtitle.revision < out.revision {
+                state.subtitle.revision = out.revision;
+                state.subtitle.overlay = out.png.map(|png| OverlayImage(png.into()));
+            }
+        }
+    }
+
     /// 退出播放:停内核、退全屏、关播放器页。
     fn exit_player(&mut self) {
         if self.player.is_none() {
@@ -728,7 +936,17 @@ impl Root {
             return;
         };
         let snapshot = core.snapshot();
+        // track-list 版本变了才拉内嵌轨(每 250ms 轮询,不能每次全量取)。
+        let track_update = match &self.player {
+            Some(state) if snapshot.tracks_version != state.subtitle.tracks_seen => {
+                Some((snapshot.tracks_version, core.list_sub_tracks()))
+            }
+            _ => None,
+        };
         drop(core_guard);
+        if let Some((version, tracks)) = track_update {
+            self.rebuild_subtitle_menu(version, tracks);
+        }
         let Some(state) = &mut self.player else {
             return;
         };

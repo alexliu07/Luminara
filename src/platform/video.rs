@@ -406,6 +406,11 @@ impl VideoHost {
         self.dirty
     }
 
+    /// 当前交换链尺寸(像素);字幕覆盖层栅格化画布用。
+    pub fn size_px(&self) -> (u32, u32) {
+        self.size_px
+    }
+
     /// 初始化 GL 渲染面;返回 mpv 用的装载器。
     pub fn init_gl(&mut self) -> PlatformResult<GlLoader> {
         if self.gl.is_none() {
