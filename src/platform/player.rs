@@ -106,8 +106,12 @@ impl PlayerCore {
         let event_thread = {
             let shared = Arc::clone(&shared);
             let shutdown = Arc::clone(&shutdown);
+            // 不传名字:libmpv2 6.0.0 的 Some(name) 分支有悬垂指针 bug
+            // (CString::new(name)?.as_ptr() 临时对象即刻释放),会让
+            // mpv_create_client 读到已释放内存并返回 NULL;None 走 null
+            // 分支由 mpv 自动生成名字,无此问题。
             let client = mpv
-                .create_client(Some("events"))
+                .create_client(None)
                 .map_err(|error| format!("mpv 事件客户端创建失败: {error}"))?;
             Some(std::thread::spawn(move || {
                 event_loop(client, shared, shutdown);
