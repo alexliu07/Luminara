@@ -104,8 +104,8 @@ const sources = [
   top: 14px;
   right: 14px;
   z-index: 20;
-  background: rgba(255, 255, 255, 0.16);   /* 玻璃底色：半透明，深浅模式通用 */
-  backdrop-filter: blur(24px) saturate(180%);
+  background: rgba(255, 255, 255, 0.1);   /* 玻璃底色：半透明，深浅模式通用 */
+  backdrop-filter: blur(10px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.28);  /* 玻璃棱边 */
   box-shadow:

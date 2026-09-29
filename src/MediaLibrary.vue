@@ -276,8 +276,8 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   border-radius: 50%;
   background: var(--tabbar-bg);
   color: var(--ink);
-  background: rgba(255, 255, 255, 0.16);   /* 玻璃底色：半透明，深浅模式通用 */
-  backdrop-filter: blur(24px) saturate(180%);
+  background: rgba(255, 255, 255, 0.1);   /* 玻璃底色：半透明，深浅模式通用 */
+  backdrop-filter: blur(10px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.28);  /* 玻璃棱边 */
   box-shadow:

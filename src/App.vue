@@ -95,8 +95,8 @@ html {
   width: min(340px, calc(100% - 32px));
   height: 56px;
   border-radius: 28px;
-  background: rgba(255, 255, 255, 0.16);   /* 玻璃底色：半透明，深浅模式通用 */
-  backdrop-filter: blur(24px) saturate(180%);
+  background: rgba(255, 255, 255, 0.1);   /* 玻璃底色：半透明，深浅模式通用 */
+  backdrop-filter: blur(10px) saturate(180%);
   -webkit-backdrop-filter: blur(24px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.28);  /* 玻璃棱边 */
   box-shadow:
@@ -118,7 +118,19 @@ html {
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
   user-select: none;
+  position: relative;
 }
+
+.tab.on::before {
+  content: '';
+  position: absolute;
+  inset: 7px 12px;
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.32);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  z-index: -1;
+}
+
 .tab .ic {
   width: 21px;
   height: 21px;
