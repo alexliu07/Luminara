@@ -1,160 +1,128 @@
 <script setup>
-import { ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { ref } from 'vue'
+import MediaLibrary from './MediaLibrary.vue'
+import FileSources from './FileSources.vue'
+import Settings from './Settings.vue'
 
-const greetMsg = ref("");
-const name = ref("");
-
-async function greet() {
-  // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-  greetMsg.value = await invoke("greet", { name: name.value });
+// tab id → 页面组件
+const pages = {
+  library: MediaLibrary,
+  sources: FileSources,
+  settings: Settings,
 }
+
+const tabs = [
+  { id: 'library', label: '媒体库', icon: 'library' },
+  { id: 'sources', label: '文件源', icon: 'folder' },
+  { id: 'settings', label: '设置', icon: 'gear' },
+]
+
+const current = ref('library')
 </script>
 
 <template>
-  <main class="container">
-    <h1>Welcome to Tauri + Vue</h1>
+  <main class="app">
+    <!-- 页面容器：随底部栏切换，KeepAlive 保留各页状态 -->
+    <KeepAlive>
+      <component :is="pages[current]" />
+    </KeepAlive>
 
-    <div class="row">
-      <a href="https://vite.dev" target="_blank">
-        <img src="/vite.svg" class="logo vite" alt="Vite logo" />
-      </a>
-      <a href="https://tauri.app" target="_blank">
-        <img src="/tauri.svg" class="logo tauri" alt="Tauri logo" />
-      </a>
-      <a href="https://vuejs.org/" target="_blank">
-        <img src="./assets/vue.svg" class="logo vue" alt="Vue logo" />
-      </a>
-    </div>
-    <p>Click on the Tauri, Vite, and Vue logos to learn more.</p>
+    <!-- 底部主导航 -->
+    <nav class="tabbar">
+      <!-- 图标 sprite -->
+      <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+        <symbol id="tb-library" viewBox="0 0 24 24">
+          <rect x="3.5" y="4.5" width="17" height="15" rx="3" />
+          <path d="M10.3 9.1 14.8 12 10.3 14.9Z" />
+        </symbol>
+        <symbol id="tb-folder" viewBox="0 0 24 24">
+          <path
+            d="M3.5 7.2a2 2 0 0 1 2-2h3.6l2 2.4h7.4a2 2 0 0 1 2 2v8.2a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2z"
+          />
+        </symbol>
+        <symbol id="tb-server" viewBox="0 0 24 24">
+          <rect x="3.5" y="4.2" width="17" height="6.2" rx="2" />
+          <rect x="3.5" y="13.6" width="17" height="6.2" rx="2" />
+          <path d="M7 7.3h.02M7 16.7h.02" stroke-width="2.4" />
+        </symbol>
+        <symbol id="tb-gear" viewBox="0 0 24 24">
+          <circle cx="12" cy="12" r="6.6" />
+          <circle cx="12" cy="12" r="3" />
+          <path d="M12 2.8v2.6M12 18.6v2.6M2.8 12h2.6M18.6 12h2.6M5.5 5.5l1.9 1.9M16.6 16.6l1.9 1.9M18.5 5.5l-1.9 1.9M7.4 16.6l-1.9 1.9" />
+        </symbol>
+      </svg>
 
-    <form class="row" @submit.prevent="greet">
-      <input id="greet-input" v-model="name" placeholder="Enter a name..." />
-      <button type="submit">Greet</button>
-    </form>
-    <p>{{ greetMsg }}</p>
+      <a
+        class="tab"
+        v-for="t in tabs"
+        :key="t.id"
+        :class="{ on: t.id === current }"
+        @click="current = t.id"
+      >
+        <svg class="ic"><use :href="'#tb-' + t.icon" /></svg>
+        <span>{{ t.label }}</span>
+      </a>
+    </nav>
   </main>
 </template>
 
-<style scoped>
-.logo.vite:hover {
-  filter: drop-shadow(0 0 2em #747bff);
-}
-
-.logo.vue:hover {
-  filter: drop-shadow(0 0 2em #249b73);
-}
-
-</style>
 <style>
-:root {
-  font-family: Inter, Avenir, Helvetica, Arial, sans-serif;
-  font-size: 16px;
-  line-height: 24px;
-  font-weight: 400;
+/* 整体 UI 缩放：1 = 原始大小，嫌小就往上调（如 1.25 / 1.5） */
+html {
+  zoom: 1.25;
+}
+</style>
 
-  color: #0f0f0f;
-  background-color: #f6f6f6;
-
-  font-synthesis: none;
-  text-rendering: optimizeLegibility;
-  -webkit-font-smoothing: antialiased;
-  -moz-osx-font-smoothing: grayscale;
-  -webkit-text-size-adjust: 100%;
+<style scoped>
+.app {
+  min-height: 100vh;
 }
 
-.container {
-  margin: 0;
-  padding-top: 10vh;
+.sprite {
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+
+.tabbar {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 10;
+  display: flex;
+  width: min(340px, calc(100% - 32px));
+  height: 56px;
+  border-radius: 28px;
+  background: #ececec;
+  box-shadow: 0 4px 16px rgba(40, 25, 30, 0.25);
+}
+
+.tab {
+  flex: 1;
   display: flex;
   flex-direction: column;
+  align-items: center;
   justify-content: center;
-  text-align: center;
-}
-
-.logo {
-  height: 6em;
-  padding: 1.5em;
-  will-change: filter;
-  transition: 0.75s;
-}
-
-.logo.tauri:hover {
-  filter: drop-shadow(0 0 2em #24c8db);
-}
-
-.row {
-  display: flex;
-  justify-content: center;
-}
-
-a {
-  font-weight: 500;
-  color: #646cff;
-  text-decoration: inherit;
-}
-
-a:hover {
-  color: #535bf2;
-}
-
-h1 {
-  text-align: center;
-}
-
-input,
-button {
-  border-radius: 8px;
-  border: 1px solid transparent;
-  padding: 0.6em 1.2em;
-  font-size: 1em;
-  font-weight: 500;
-  font-family: inherit;
-  color: #0f0f0f;
-  background-color: #ffffff;
-  transition: border-color 0.25s;
-  box-shadow: 0 2px 2px rgba(0, 0, 0, 0.2);
-}
-
-button {
+  gap: 3px;
+  font-size: 10.5px;
+  color: #8d8789;
+  text-decoration: none;
   cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
 }
-
-button:hover {
-  border-color: #396cd8;
+.tab .ic {
+  width: 21px;
+  height: 21px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
 }
-button:active {
-  border-color: #396cd8;
-  background-color: #e8e8e8;
+.tab.on {
+  color: #262022;
 }
-
-input,
-button {
-  outline: none;
-}
-
-#greet-input {
-  margin-right: 5px;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    color: #f6f6f6;
-    background-color: #2f2f2f;
-  }
-
-  a:hover {
-    color: #24c8db;
-  }
-
-  input,
-  button {
-    color: #ffffff;
-    background-color: #0f0f0f98;
-  }
-  button:active {
-    background-color: #0f0f0f69;
-  }
-}
-
 </style>
