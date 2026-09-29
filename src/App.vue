@@ -95,8 +95,14 @@ html {
   width: min(340px, calc(100% - 32px));
   height: 56px;
   border-radius: 28px;
-  background: #ececec;
-  box-shadow: 0 4px 16px rgba(40, 25, 30, 0.25);
+  background: rgba(255, 255, 255, 0.16);   /* 玻璃底色：半透明，深浅模式通用 */
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);  /* 玻璃棱边 */
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),    /* 顶部高光边（折射光） */
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),   /* 底部微反光 */
+      0 4px 16px rgba(40, 25, 30, 0.25);
 }
 
 .tab {
@@ -107,7 +113,7 @@ html {
   justify-content: center;
   gap: 3px;
   font-size: 10.5px;
-  color: #8d8789;
+  color: var(--sub);
   text-decoration: none;
   cursor: pointer;
   -webkit-tap-highlight-color: transparent;
@@ -123,6 +129,6 @@ html {
   stroke-linejoin: round;
 }
 .tab.on {
-  color: #262022;
+  color: var(--ink);
 }
 </style>

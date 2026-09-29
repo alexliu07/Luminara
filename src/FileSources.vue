@@ -42,8 +42,8 @@ const sources = [
 .page {
   min-height: 100vh;
   padding: 18px 14px 110px;
-  background: rgba(0,0,0,0.9);
-  color: #241e20;
+  background: var(--bg);
+  color: var(--card-ink);
   font-family: 'PingFang SC', 'HarmonyOS Sans SC', 'MiSans', 'Microsoft YaHei',
     -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -52,7 +52,7 @@ const sources = [
   margin: 0;
   font-size: 20px;
   font-weight: 700;
-  color: #fff;
+  color: var(--ink);
 }
 .list {
   margin: 0;
@@ -67,7 +67,7 @@ const sources = [
   margin-bottom: 10px;
   padding: 13px 15px;
   border-radius: 12px;
-  background: #e9e5e5;
+  background: var(--card);
   box-shadow: 0 1px 3px rgba(40, 25, 30, 0.16);
 }
 .item-name {
@@ -78,11 +78,11 @@ const sources = [
 .item-sub {
   margin: 3px 0 0;
   font-size: 10px;
-  color: #5f585b;
+  color: var(--sub);
 }
 .item-side {
   font-size: 12px;
-  color: rgba(36, 30, 32, 0.62);
+  color: var(--sub);
 }
 .top-bar {
   display: flex;
@@ -97,11 +97,21 @@ const sources = [
   justify-content: center;
   width: 34px;
   height: 34px;
-  border: 0;
   border-radius: 50%;
-  background: #fff;
-  color: #241e20;
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  background: var(--tabbar-bg);
+  color: var(--ink);
+  position: fixed;
+  top: 14px;
+  right: 14px;
+  z-index: 20;
+  background: rgba(255, 255, 255, 0.16);   /* 玻璃底色：半透明，深浅模式通用 */
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);  /* 玻璃棱边 */
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),    /* 顶部高光边（折射光） */
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),   /* 底部微反光 */
+      0 4px 16px rgba(40, 25, 30, 0.25);
 }
 
 .ic {

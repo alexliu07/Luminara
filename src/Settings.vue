@@ -24,8 +24,8 @@ const rows = [
 .page {
   min-height: 100vh;
   padding: 18px 14px 110px;
-  background: rgba(0,0,0,0.9);
-  color: #241e20;
+  background: var(--bg);
+  color: var(--card-ink);
   font-family: 'PingFang SC', 'HarmonyOS Sans SC', 'MiSans', 'Microsoft YaHei',
     -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
@@ -34,7 +34,7 @@ const rows = [
   margin: 0 0 14px;
   font-size: 20px;
   font-weight: 700;
-  color: #fff;
+  color: var(--ink);
 }
 .list {
   margin: 0;
@@ -49,7 +49,7 @@ const rows = [
   margin-bottom: 10px;
   padding: 13px 15px;
   border-radius: 12px;
-  background: #e9e5e5;
+  background: var(--card);
   box-shadow: 0 1px 3px rgba(40, 25, 30, 0.16);
 }
 .item-name {
@@ -58,6 +58,6 @@ const rows = [
 }
 .item-value {
   font-size: 12px;
-  color: rgba(36, 30, 32, 0.62);
+  color: var(--sub);
 }
 </style>

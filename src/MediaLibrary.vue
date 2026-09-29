@@ -188,11 +188,6 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
 <style scoped>
 /* ── 基础 ───────────────────────────────────────────── */
 .media-page {
-  --bg: #a59fa1;
-  --ink: #241e20;
-  --sub: #5f585b;
-  --white: #fff;
-
   min-height: 100vh;
   padding: 0;
   background: var(--bg);
@@ -278,11 +273,17 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   justify-content: center;
   width: 34px;
   height: 34px;
-  border: 0;
   border-radius: 50%;
-  background: var(--white);
+  background: var(--tabbar-bg);
   color: var(--ink);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.16);   /* 玻璃底色：半透明，深浅模式通用 */
+  backdrop-filter: blur(24px) saturate(180%);
+  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);  /* 玻璃棱边 */
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),    /* 顶部高光边（折射光） */
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),   /* 底部微反光 */
+      0 4px 16px rgba(40, 25, 30, 0.25);
 }
 
 .hero-info {
@@ -366,14 +367,14 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   margin: 0;
   font-size: 20px;
   font-weight: 700;
-  color: var(--white);
+  color: var(--ink);
 }
 .sec-more {
   display: inline-flex;
   align-items: center;
   gap: 2px;
   font-size: 12px;
-  color: rgba(255, 255, 255, 0.85);
+  color: var(--ink);
 }
 
 .row {
