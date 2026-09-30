@@ -59,6 +59,12 @@ fn list_sources(app: tauri::AppHandle)->Result<Vec<Source>, String>{
     let rows = stmt.query_map([],|row|Ok(Source{id: row.get(0)?,source: row.get(1)?,name: row.get(2)?,data_a: row.get(3)?})).map_err(|e|e.to_string())?;
     rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
 }
+#[tauri::command]
+fn delete_source(app: tauri::AppHandle,id: i64)->Result<(), String>{
+    let db = open_db(&app)?;
+    db.execute("DELETE FROM sources WHERE id = ?1",params![id]).map_err(|e|e.to_string())?;
+    Ok(())
+}
 
 
 
@@ -67,7 +73,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources])
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

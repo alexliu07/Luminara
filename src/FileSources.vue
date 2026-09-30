@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, nextTick } from 'vue'
 import {invoke} from "@tauri-apps/api/core";
 // 样例数据
 const sources = ref([])
@@ -9,6 +9,8 @@ const ctxOpen = ref(false)
 const ctxX = ref(0)
 const ctxY = ref(0)
 const ctxItem = ref(null)
+const ctxMenuEl = ref(null)
+const confirmOpen = ref(false)
 
 const menuItems = [
   { id: 'local', label: '添加本地文件夹' },
@@ -18,12 +20,16 @@ const menuItems = [
 async function loadSources() {
   try {
     sources.value = await invoke('list_sources')
+    refreshScrollbar()
   } catch (e) {
     console.error('加载文件源失败', e)
   }
 }
 onMounted(loadSources)
-
+function refreshScrollbar() {
+  // 等列表渲染出新高度，再让 App.vue 的 updateScrollbar 重算
+  nextTick(() => window.dispatchEvent(new Event('resize')))
+}
 async function onMenuItem(item) {
   menuOpen.value = false
   // TODO: 各项的实际动作
@@ -32,6 +38,7 @@ async function onMenuItem(item) {
       let data = await invoke('list_sources')
       console.log(data);
       sources.value = data;
+      refreshScrollbar();
     }
   }
 }
@@ -42,14 +49,39 @@ function uiScale() {
 
 function openCtx(e, s) {
   ctxItem.value = s
-  ctxX.value = e.clientX / uiScale()
-  ctxY.value = e.clientY / uiScale()
+  const scale = uiScale()
+  const x = e.clientX / scale
+  const y = e.clientY / scale
+  ctxX.value = x
+  ctxY.value = y
   ctxOpen.value = true
   menuOpen.value = false // 顺手关掉加号菜单
+
+  // 菜单进 DOM 后量出尺寸，把位置夹在视口内
+  nextTick(() => {
+    const el = ctxMenuEl.value
+    if (!el) return
+    const m = 8 // 离边最小留白
+    const vw = window.innerWidth / scale
+    const vh = window.innerHeight / scale
+    ctxX.value = Math.max(m, Math.min(x, vw - el.offsetWidth - m))
+    ctxY.value = Math.max(m, Math.min(y, vh - el.offsetHeight - m))
+  })
 }
 function onDeleteSource() {
   ctxOpen.value = false
-  // TODO: 后面接删除逻辑（ctxItem.value 里有被点的文件源）
+  confirmOpen.value = true
+}
+function onCancelDelete(){
+  confirmOpen.value = false
+}
+async function onConfirmDelete(){
+  confirmOpen.value = false
+  const s = ctxItem.value
+  if (!s) return
+  await invoke('delete_source', { id: s.id })
+  sources.value = sources.value.filter(x => x.id !== s.id)  // 先本地移除
+  refreshScrollbar()
 }
 </script>
 
@@ -81,8 +113,20 @@ function onDeleteSource() {
       </Transition>
     </div>
     <Transition name="menu">
-      <div class="src-menu ctx-menu" v-if="ctxOpen" :style="{ left: ctxX + 'px', top: ctxY + 'px' }">
+      <div class="src-menu ctx-menu" ref="ctxMenuEl" v-if="ctxOpen" :style="{ left: ctxX + 'px', top: ctxY + 'px' }">
         <button class="ctx-menu-item src-menu-item danger" type="button" @click="onDeleteSource">删除文件源</button>
+      </div>
+    </Transition>
+    <Transition name="confirm">
+      <div class="confirm-backdrop" v-if="confirmOpen" @click="onCancelDelete">
+        <div class="confirm-box" @click.stop>
+          <h2 class="confirm-title">删除文件源</h2>
+          <p class="confirm-text">确定要删除「{{ ctxItem?.name }}」吗？只会移出列表，不会删除磁盘上的文件。</p>
+          <div class="confirm-actions">
+            <button class="confirm-btn" type="button" @click="onCancelDelete">取消</button>
+            <button class="confirm-btn danger" type="button" @click="onConfirmDelete">删除</button>
+          </div>
+        </div>
       </div>
     </Transition>
     <ul class="list">
@@ -223,7 +267,7 @@ function onDeleteSource() {
   transition: background 0.15s ease;
 }
 .src-menu-item:hover {
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--tab-bg);
 }
 
 /* 弹出动画：从按钮右上角弹出 */
@@ -248,6 +292,75 @@ function onDeleteSource() {
 }
 .ctx-menu-item.danger:hover {
   background: rgba(229, 72, 77, 0.16);
+}
+/* 确认弹窗 */
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;                       /* 盖住菜单(22)和滚动条(30)，模态就该全盖 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 16, 18, 0.28); /* 压暗背景突出弹窗 */
+}
+.confirm-box {
+  width: min(320px, calc(100% - 48px));
+  padding: 18px 18px 14px;
+  border-radius: 18px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(5px) saturate(180%);
+  -webkit-backdrop-filter: blur(5px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),
+      0 4px 16px rgba(40, 25, 30, 0.25);
+}
+.confirm-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+.confirm-text {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--sub);
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.confirm-btn {
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.18);
+  font-size: 12px;
+  color: var(--ink);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.confirm-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+.confirm-btn.danger {
+  background: #e5484d;
+  color: #ffffff;
+}
+.confirm-btn.danger:hover {
+  background: #f2555a;
+}
+
+.confirm-enter-active,
+.confirm-leave-active {
+  transition: opacity 0.18s ease;
+}
+.confirm-enter-from,
+.confirm-leave-to {
+  opacity: 0;
 }
 
 </style>
