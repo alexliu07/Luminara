@@ -2,7 +2,7 @@
 import { ref, onMounted, nextTick } from 'vue'
 import {invoke} from "@tauri-apps/api/core";
 import { showToast, hideToast } from './toast.js'
-// 样例数据
+// 数据
 const sources = ref([])
 const sourcemap = {0:'本地',1:'WebDAV'}
 const menuOpen = ref(false)
@@ -12,10 +12,13 @@ const ctxY = ref(0)
 const ctxItem = ref(null)
 const ctxMenuEl = ref(null)
 const confirmOpen = ref(false)
+const webdavOpen = ref(false)
+const webdav = ref({ name: '', host: '', port: '', https: true, username: '', password: '', path: '/' })
+const testing = ref(false)
 
 const menuItems = [
   { id: 'local', label: '添加本地文件夹' },
-  { id: 'network', label: '添加 WebDAV 共享' }
+  { id: 'webdav', label: '添加 WebDAV 共享' }
 ]
 
 async function loadSources() {
@@ -37,17 +40,20 @@ async function onMenuItem(item) {
   if(item.id === 'local'){
     const id = await invoke('add_local_source');
     if(id){
+      sources.value = await invoke('list_sources');
+      refreshScrollbar();
       showToast('正在扫描文件源','spin')
       let n;
       try{
-        sources.value = await invoke('list_sources');
-        n = await invoke('index_source',{id})
-        refreshScrollbar();
+        n = await invoke('index_local_source',{id})
       } finally {
         hideToast()
         showToast('扫描完毕，添加了 '+String(n.added)+' 个文件，删除了 '+String(n.removed)+' 个文件，更新了 '+String(n.updated)+' 个文件','check',2000);
       }
     }
+  }
+  if(item.id === 'webdav'){
+    webdavOpen.value = true
   }
 }
 
@@ -93,14 +99,73 @@ async function onConfirmDelete(){
 }
 async function onScan(){
   ctxOpen.value = false;
+  let source = ctxItem.value.source;
   let id = ctxItem.value.id;
   showToast('正在扫描文件源','spin')
   let n;
   try{
-    n = await invoke('index_source',{id})
+    if (source === 0){
+      n = await invoke('index_local_source',{id})
+    }
+    if(source === 1){
+      n = await invoke('index_webdav_source',{id});
+    }
   } finally {
     hideToast()
     showToast('扫描完毕，添加了 '+String(n.added)+' 个文件，删除了 '+String(n.removed)+' 个文件，更新了 '+String(n.updated)+' 个文件','check',2000);
+  }
+}
+
+function onHttpsToggle() {
+  // 端口没手填过就跟着协议走
+  if (!webdav.value.port || webdav.value.port === '80' || webdav.value.port === '443') {
+    webdav.value.port = webdav.value.https ? '443' : '80'
+  }
+}
+
+async function onAddWebdav() {
+  const args = collectWebdav()
+  if(!args) return
+  try {
+    await invoke('add_webdav_source', args)
+    webdavOpen.value = false
+    sources.value = await invoke('list_sources')
+    refreshScrollbar()
+    showToast('正在扫描文件源','spin')
+    let n;
+    try{
+      n = await invoke('index_webdav_source',{id})
+    } finally {
+      hideToast()
+      showToast('扫描完毕，添加了 '+String(n.added)+' 个文件，删除了 '+String(n.removed)+' 个文件，更新了 '+String(n.updated)+' 个文件','check',2000);
+    }
+  } catch (e) {
+    showToast('添加失败：' + e, 'alert', 2500)
+  }
+}
+function collectWebdav() {
+  const w = webdav.value
+  w.name = w.name.trim(); w.host = w.host.trim(); w.path = w.path.trim()
+  if (!w.name || !w.host) { showToast('请填写名称和服务器地址', 'alert', 2000); return null }
+  const port = parseInt(w.port || (w.https ? '443' : '80'), 10)
+  if (!(port >= 1 && port <= 65535)) { showToast('端口号不正确', 'alert', 2000); return null }
+  return {
+    name: w.name, host: w.host, port,
+    https: w.https, username: w.username, password: w.password, path: w.path || '/'
+  }
+}
+
+async function onTestWebdav() {
+  const args = collectWebdav()
+  if (!args) return
+  testing.value = true
+  try {
+    await invoke('test_webdav_source', args)
+    showToast('连接成功', 'check', 2000)
+  } catch (e) {
+    showToast('连接失败：' + e, 'alert', 2500)
+  } finally {
+    testing.value = false
   }
 }
 </script>
@@ -146,6 +211,46 @@ async function onScan(){
           <div class="confirm-actions">
             <button class="confirm-btn" type="button" @click="onCancelDelete">取消</button>
             <button class="confirm-btn danger" type="button" @click="onConfirmDelete">删除</button>
+          </div>
+        </div>
+      </div>
+    </Transition>
+    <Transition name="confirm">
+      <div class="confirm-backdrop" v-if="webdavOpen" @click="webdavOpen = false">
+        <div class="confirm-box webdav-box" @click.stop>
+          <h2 class="confirm-title">添加 WebDAV 共享</h2>
+          <div class="form-row">
+            <span class="form-label">文件源名称</span>
+            <input class="form-input" v-model="webdav.name" placeholder="我的网盘" />
+          </div>
+          <div class="form-row">
+            <span class="form-label">服务器地址</span>
+            <input class="form-input" v-model="webdav.host" placeholder="dav.example.com" />
+          </div>
+          <div class="form-row">
+            <span class="form-label">端口号</span>
+            <input class="form-input" v-model="webdav.port" inputmode="numeric" placeholder="443" />
+          </div>
+          <div class="form-row">
+            <span class="form-label">启用 HTTPS</span>
+            <input class="form-check" type="checkbox" v-model="webdav.https" @change="onHttpsToggle" />
+          </div>
+          <div class="form-row">
+            <span class="form-label">用户名</span>
+            <input class="form-input" v-model="webdav.username" />
+          </div>
+          <div class="form-row">
+            <span class="form-label">密码</span>
+            <input class="form-input" type="password" v-model="webdav.password" />
+          </div>
+          <div class="form-row">
+            <span class="form-label">路径</span>
+            <input class="form-input" v-model="webdav.path" placeholder="/dav" />
+          </div>
+          <div class="confirm-actions">
+            <button class="confirm-btn test-btn" type="button" :disabled="testing" @click="onTestWebdav">{{ testing ? '测试中…' : '测试连接' }}</button>
+            <button class="confirm-btn" type="button" @click="webdavOpen = false">取消</button>
+            <button class="confirm-btn primary" type="button" @click="onAddWebdav">添加</button>
           </div>
         </div>
       </div>
@@ -288,7 +393,7 @@ async function onScan(){
   transition: background 0.15s ease;
 }
 .src-menu-item:hover {
-  background: var(--tab-bg);
+  background: var(--option-bg);
 }
 
 /* 弹出动画：从按钮右上角弹出 */
@@ -384,4 +489,46 @@ async function onScan(){
   opacity: 0;
 }
 
+/* WebDAV 表单弹窗 */
+.webdav-box {
+  width: min(340px, calc(100% - 48px));
+}
+.form-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+}
+.form-label {
+  font-size: 12px;
+  color: var(--sub);
+  flex-shrink: 0;
+}
+.form-input {
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.18);
+  font-size: 12px;
+  color: var(--ink);
+  outline: none;
+}
+.form-input:focus {
+  border-color: rgba(255, 255, 255, 0.55);
+}
+.form-check {
+  width: 16px;
+  height: 16px;
+  accent-color: var(--ink);
+}
+.confirm-btn.primary {
+  background: var(--ink);
+  color: var(--bg);
+}
+.test-btn { margin-right: auto; }        /* 顶到左侧，取消/添加留在右侧 */
+.confirm-btn:disabled { opacity: 0.5; cursor: default; }
 </style>
