@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onMounted, nextTick } from 'vue'
 import {invoke} from "@tauri-apps/api/core";
+import { showToast, hideToast } from './toast.js'
 // 样例数据
 const sources = ref([])
 const sourcemap = {0:'本地',1:'WebDAV'}
@@ -34,11 +35,18 @@ async function onMenuItem(item) {
   menuOpen.value = false
   // TODO: 各项的实际动作
   if(item.id === 'local'){
-    if(await invoke('add_local_source')){
-      let data = await invoke('list_sources')
-      console.log(data);
-      sources.value = data;
-      refreshScrollbar();
+    const id = await invoke('add_local_source');
+    if(id){
+      showToast('正在扫描文件源','spin')
+      let n;
+      try{
+        sources.value = await invoke('list_sources');
+        n = await invoke('index_source',{id})
+        refreshScrollbar();
+      } finally {
+        hideToast()
+        showToast('扫描完毕，添加了 '+String(n.added)+' 个文件，删除了 '+String(n.removed)+' 个文件，更新了 '+String(n.updated)+' 个文件','check',2000);
+      }
     }
   }
 }
@@ -83,6 +91,18 @@ async function onConfirmDelete(){
   sources.value = sources.value.filter(x => x.id !== s.id)  // 先本地移除
   refreshScrollbar()
 }
+async function onScan(){
+  ctxOpen.value = false;
+  let id = ctxItem.value.id;
+  showToast('正在扫描文件源','spin')
+  let n;
+  try{
+    n = await invoke('index_source',{id})
+  } finally {
+    hideToast()
+    showToast('扫描完毕，添加了 '+String(n.added)+' 个文件，删除了 '+String(n.removed)+' 个文件，更新了 '+String(n.updated)+' 个文件','check',2000);
+  }
+}
 </script>
 
 <template>
@@ -114,6 +134,7 @@ async function onConfirmDelete(){
     </div>
     <Transition name="menu">
       <div class="src-menu ctx-menu" ref="ctxMenuEl" v-if="ctxOpen" :style="{ left: ctxX + 'px', top: ctxY + 'px' }">
+        <button class="ctx-menu-item src-menu-item" type="button" @click="onScan">扫描文件源</button>
         <button class="ctx-menu-item src-menu-item danger" type="button" @click="onDeleteSource">删除文件源</button>
       </div>
     </Transition>

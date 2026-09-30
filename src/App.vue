@@ -3,6 +3,7 @@ import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import MediaLibrary from './MediaLibrary.vue'
 import FileSources from './FileSources.vue'
 import Settings from './Settings.vue'
+import { toast, hideToast} from './toast.js'
 
 // tab id → 页面组件
 const pages = {
@@ -105,6 +106,25 @@ function updateIndicator() {
 
 <template>
   <main class="app">
+    <!-- 全局 toast：KeepAlive 外面，切页不消失 -->
+    <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+      <symbol id="t-spin" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+      </symbol>
+      <symbol id="t-check" viewBox="0 0 24 24">
+        <path d="M5 12.5 10 17.5 19 7.5" />
+      </symbol>
+      <symbol id="t-alert" viewBox="0 0 24 24">
+        <circle cx="12" cy="12" r="9" />
+        <path d="M12 7v6M12 16.5v.5" />
+      </symbol>
+    </svg>
+    <Transition name="toast">
+      <div class="toast" v-if="toast" @click="hideToast">
+        <svg class="toast-ic" :class="{ spin: toast.icon === 'spin' }"><use :href="'#t-' + toast.icon" /></svg>
+        <span>{{ toast.text }}</span>
+      </div>
+    </Transition>
     <!-- 自定义滚动条 -->
     <div class="scrollbar" ref="trackEl">
       <div class="scrollbar-thumb" ref="thumbEl" @pointerdown.prevent="onThumbDown"></div>
@@ -246,5 +266,56 @@ function updateIndicator() {
   background: rgba(255, 255, 255, 0.55);
   transition: opacity 0.25s;
   will-change: transform;
+}
+/* ── 全局 toast ─────────────────────────────── */
+.toast {
+  position: fixed;
+  top: 14px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 25;                 /* 高于菜单(22)、低于确认弹窗(40) */
+  height: 34px;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 14px;
+  border-radius: 17px;
+  font-size: 11px;
+  color: var(--ink);
+  background: var(--glass-bg);
+  backdrop-filter: blur(5px) saturate(180%);
+  -webkit-backdrop-filter: blur(5px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),
+      0 4px 16px rgba(40, 25, 30, 0.25);
+}
+.toast-ic {
+  width: 15px;
+  height: 15px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex-shrink: 0;
+}
+.toast-ic.spin {
+  stroke-width: 2.4;
+  stroke-dasharray: 42 16;     /* 圆留缺口，转起来就是加载圈 */
+  animation: spin 0.9s linear infinite;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.toast-enter-active,
+.toast-leave-active {
+  transition: opacity 0.18s ease;
+}
+.toast-enter-from,
+.toast-leave-to {
+  opacity: 0;
 }
 </style>
