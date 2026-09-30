@@ -14,13 +14,20 @@ struct Source{
     name: String,
     data_a: String
 }
-
 // 索引更新数据结构体
 #[derive(Serialize)]
 struct IndexStat{
     added: u32,
     updated: u32,
     removed: u32,
+}
+// 文件条目结构体
+#[derive(Serialize)]
+struct FileEntry{
+    rel_path: String,
+    kind: String,      // video / subtitle
+    size: i64,
+    mtime: i64,
 }
 
 // 数据库初始化
@@ -332,15 +339,26 @@ async fn index_webdav_source(app: tauri::AppHandle, id: i64)->Result<IndexStat, 
     }
     write_index(&mut db, id, &out)
 }
-
-
+// 列出文件源下已索引的文件
+#[tauri::command]
+fn list_files(app: tauri::AppHandle, id: i64)->Result<Vec<FileEntry>, String>{
+    let db = open_db(&app)?;
+    let mut stmt = db.prepare("SELECT rel_path, type, size, mtime FROM files WHERE lib_id = ?1 ORDER BY rel_path").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map(params![id], |r| Ok(FileEntry{
+        rel_path: r.get(0)?,
+        kind: r.get(1)?,
+        size: r.get(2)?,
+        mtime: r.get(3)?,
+    })).map_err(|e|e.to_string())?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source])
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

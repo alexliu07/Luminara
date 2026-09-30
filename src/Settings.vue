@@ -2,8 +2,6 @@
 // 样例数据
 const rows = [
   { label: '扫描间隔', value: '每天' },
-  { label: '播放器', value: '内置' },
-  { label: '字幕语言', value: '简体中文' },
   { label: '关于', value: 'v1.0.0' },
 ]
 </script>

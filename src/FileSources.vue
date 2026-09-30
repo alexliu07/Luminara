@@ -5,6 +5,9 @@ import { showToast, hideToast } from './toast.js'
 // 数据
 const sources = ref([])
 const sourcemap = {0:'本地',1:'WebDAV'}
+const files = ref([])
+const filesSource = ref(null)   // null=显示源列表，否则显示该源的文件
+const typemap = { video: '视频', subtitle: '字幕' }
 const menuOpen = ref(false)
 const ctxOpen = ref(false)
 const ctxX = ref(0)
@@ -15,12 +18,12 @@ const confirmOpen = ref(false)
 const webdavOpen = ref(false)
 const webdav = ref({ name: '', host: '', port: '', https: true, username: '', password: '', path: '/' })
 const testing = ref(false)
-
 const menuItems = [
   { id: 'local', label: '添加本地文件夹' },
   { id: 'webdav', label: '添加 WebDAV 共享' }
 ]
 
+// 加载文件源列表
 async function loadSources() {
   try {
     sources.value = await invoke('list_sources')
@@ -30,10 +33,12 @@ async function loadSources() {
   }
 }
 onMounted(loadSources)
+// 刷新滚动条
 function refreshScrollbar() {
   // 等列表渲染出新高度，再让 App.vue 的 updateScrollbar 重算
   nextTick(() => window.dispatchEvent(new Event('resize')))
 }
+// 添加文件源菜单点击事件
 async function onMenuItem(item) {
   menuOpen.value = false
   // TODO: 各项的实际动作
@@ -57,10 +62,12 @@ async function onMenuItem(item) {
   }
 }
 
+// 获取界面缩放比例
 function uiScale() {
   return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ui-scale')) || 1
 }
 
+// 打开右键菜单
 function openCtx(e, s) {
   ctxItem.value = s
   const scale = uiScale()
@@ -82,6 +89,8 @@ function openCtx(e, s) {
     ctxY.value = Math.max(m, Math.min(y, vh - el.offsetHeight - m))
   })
 }
+
+// 删除文件源相关
 function onDeleteSource() {
   ctxOpen.value = false
   confirmOpen.value = true
@@ -97,6 +106,8 @@ async function onConfirmDelete(){
   sources.value = sources.value.filter(x => x.id !== s.id)  // 先本地移除
   refreshScrollbar()
 }
+
+// 手动扫描文件源
 async function onScan(){
   ctxOpen.value = false;
   let source = ctxItem.value.source;
@@ -116,13 +127,40 @@ async function onScan(){
   }
 }
 
+// 浏览文件源相关
+async function onOpenSource(s) {
+  filesSource.value = s
+  try {
+    files.value = await invoke('list_files', { id: s.id })
+  } catch (e) {
+    showToast('加载文件失败：' + e, 'alert', 2500)
+    filesSource.value = null
+    return
+  }
+  refreshScrollbar()
+}
+function onBack() {
+  filesSource.value = null
+  files.value = []
+  refreshScrollbar()
+}
+function fmtSize(n) {
+  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB'
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB'
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB'
+  return n + ' B'
+}
+function fmtTime(t) {
+  return new Date(t * 1000).toLocaleString()
+}
+
+// WebDAV添加相关
 function onHttpsToggle() {
   // 端口没手填过就跟着协议走
   if (!webdav.value.port || webdav.value.port === '80' || webdav.value.port === '443') {
     webdav.value.port = webdav.value.https ? '443' : '80'
   }
 }
-
 async function onAddWebdav() {
   const args = collectWebdav()
   if(!args) return
@@ -154,7 +192,6 @@ function collectWebdav() {
     https: w.https, username: w.username, password: w.password, path: w.path || '/'
   }
 }
-
 async function onTestWebdav() {
   const args = collectWebdav()
   if (!args) return
@@ -176,10 +213,16 @@ async function onTestWebdav() {
       <symbol id="i-plus" viewBox="0 0 24 24">
         <path d="M12 5.5v13M5.5 12h13" />
       </symbol>
+      <symbol id="i-back" viewBox="0 0 24 24">
+        <path d="M15 5.5 8.5 12l6.5 6.5" />
+      </symbol>
     </svg>
     <div class="top-bar">
-      <h1 class="page-title">文件源</h1>
-      <button class="round-btn" type="button" aria-label="添加" @click="menuOpen = !menuOpen">
+      <button v-if="filesSource" class="round-btn" type="button" aria-label="返回" @click="onBack">
+        <svg class="ic"><use href="#i-back" /></svg>
+      </button>
+      <h1 class="page-title">{{ filesSource ? filesSource.name : '文件源' }}</h1>
+      <button v-if="!filesSource" class="round-btn" type="button" aria-label="添加" @click="menuOpen = !menuOpen">
         <svg class="ic"><use href="#i-plus" /></svg>
       </button>
       <div class="menu-backdrop" v-if="menuOpen || ctxOpen" @click="menuOpen = false; ctxOpen = false"></div>
@@ -255,11 +298,24 @@ async function onTestWebdav() {
         </div>
       </div>
     </Transition>
-    <ul class="list">
-      <li class="item" v-for="s in sources" :key="s.id" @contextmenu.prevent="openCtx($event,s)">
+    <ul class="list" v-if="!filesSource">
+      <li class="item" v-for="s in sources" :key="s.id" @click="onOpenSource(s)" @contextmenu.prevent="openCtx($event,s)">
         <div class="item-main">
           <p class="item-name">{{ s.name }}</p>
           <p class="item-sub">{{sourcemap[s.source]}} | {{ s.data_a }}</p>
+        </div>
+      </li>
+    </ul>
+    <ul class="list" v-else>
+      <li class="item" v-for="f in files" :key="f.rel_path">
+        <div class="item-main">
+          <p class="item-name">{{ f.rel_path }}</p>
+          <p class="item-sub">{{ typemap[f.kind] }} | {{ fmtSize(f.size) }} | {{ fmtTime(f.mtime) }}</p>
+        </div>
+      </li>
+      <li class="item" v-if="!files.length">
+        <div class="item-main">
+          <p class="item-sub">暂无索引文件，右键源可扫描</p>
         </div>
       </li>
     </ul>
@@ -303,6 +359,7 @@ async function onTestWebdav() {
   border-radius: 12px;
   background: var(--card);
   box-shadow: 0 1px 3px rgba(40, 25, 30, 0.16);
+  cursor: pointer;
 }
 .item-name {
   margin: 0;
