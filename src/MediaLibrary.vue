@@ -188,7 +188,7 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
 <style scoped>
 /* ── 基础 ───────────────────────────────────────────── */
 .media-page {
-  min-height: 100vh;
+  min-height: calc(100vh / var(--ui-scale));
   padding: 0;
   background: var(--bg);
   color: var(--ink);
@@ -255,7 +255,7 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   left: 0;
   right: 0;
   z-index: 20;
-  height: 34px;
+  height: 62px;
   margin-bottom: -62px;
   display: flex;
   align-items: center;
@@ -274,11 +274,10 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   width: 34px;
   height: 34px;
   border-radius: 50%;
-  background: var(--tabbar-bg);
   color: var(--ink);
-  background: rgba(255, 255, 255, 0.1);   /* 玻璃底色：半透明，深浅模式通用 */
-  backdrop-filter: blur(10px) saturate(180%);
-  -webkit-backdrop-filter: blur(24px) saturate(180%);
+  background: var(--glass-bg);   /* 玻璃底色：半透明，深浅模式通用 */
+  backdrop-filter: blur(5px) saturate(180%);
+  -webkit-backdrop-filter: blur(5px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.28);  /* 玻璃棱边 */
   box-shadow:
       inset 0 1px 0 rgba(255, 255, 255, 0.45),    /* 顶部高光边（折射光） */
@@ -350,7 +349,7 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   background: rgba(255, 255, 255, 0.45);
 }
 .dot.on {
-  background: var(--white);
+  background: #ffffff;
 }
 
 /* ── 通用 section ───────────────────────────────────── */
@@ -429,7 +428,7 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   background: rgba(0, 0, 0, 0.72);
   font-size: 9.5px;
   font-weight: 600;
-  color: var(--white);
+  color: #ffffff;
   letter-spacing: 0.2px;
 }
 
@@ -468,6 +467,6 @@ const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
   display: block;
   height: 100%;
   border-radius: 2px;
-  background: var(--white);
+  background: #ffffff;
 }
 </style>

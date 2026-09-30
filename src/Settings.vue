@@ -22,7 +22,7 @@ const rows = [
 
 <style scoped>
 .page {
-  min-height: 100vh;
+  min-height: calc(100vh / var(--ui-scale));
   padding: 18px 14px 110px;
   background: var(--bg);
   color: var(--card-ink);

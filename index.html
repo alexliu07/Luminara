@@ -6,17 +6,20 @@
     <title>Luminara</title>
   </head>
   <style>
-      body{
-          margin: 0;
+      *,
+      *::before,
+      *::after {
+          box-sizing: border-box;
       }
       :root {
+          --ui-scale: 1.25;
           --bg: #cccaca;        /* 页面背景 */
           --ink: #241e20;       /* 主文字 */
           --sub: #5f585b;       /* 次要文字 */
           --card: #e9e5e5;      /* 卡片背景 */
           --card-ink: #241e20;  /* 卡片文字 */
-          --white: #fff;
-          --tabbar-bg: #ececec;
+          --glass-bg: rgba(255,255,255,0.6);
+          --tab-bg: rgba(255,255,255,0.4);
       }
 
       @media (prefers-color-scheme: dark) {
@@ -26,8 +29,23 @@
               --sub: #a8a2a5;
               --card: #2a272b;
               --card-ink: #ece8ea;
-              --tabbar-bg: #2f2c30;
+              --glass-bg: rgba(50,50,50,0.5);
+              --tab-bg: rgba(50,50,50,0.3);
           }
+      }
+      html {
+          zoom: var(--ui-scale);
+          scrollbar-width: none;/* Firefox */
+          overscroll-behavior: none;
+          background: var(--bg);
+      }
+      html::-webkit-scrollbar {
+          display: none;              /* Chromium / WebView2 */
+      }
+      body{
+          margin: 0;
+          background: var(--bg);
+          overscroll-behavior: none;
       }
   </style>
 
