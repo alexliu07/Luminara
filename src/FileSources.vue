@@ -567,15 +567,15 @@ async function onTestWebdav() {
   min-width: 0;
   height: 28px;
   padding: 0 10px;
-  border: 1px solid rgba(255, 255, 255, 0.28);
+  border: 1px solid var(--input-border);
   border-radius: 8px;
-  background: rgba(255, 255, 255, 0.18);
+  background: var(--input-bg);
   font-size: 12px;
   color: var(--ink);
   outline: none;
 }
 .form-input:focus {
-  border-color: rgba(255, 255, 255, 0.55);
+  border-color: var(--input-border);
 }
 .form-check {
   width: 16px;

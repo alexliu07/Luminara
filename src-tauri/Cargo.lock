@@ -2099,14 +2099,17 @@ name = "luminara"
 version = "0.1.0"
 dependencies = [
  "httpdate",
+ "regex",
  "reqwest 0.12.28",
  "roxmltree",
  "rusqlite",
  "serde",
+ "serde_json",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",
  "tauri-plugin-opener",
+ "tokio",
 ]
 
 [[package]]

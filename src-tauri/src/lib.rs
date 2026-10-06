@@ -1,10 +1,14 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use serde::{Serialize};
+use serde_json::{json, Value};
 use std::fs;
 use std::collections::{HashMap,HashSet};
+use std::sync::OnceLock;
 use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
+use regex::Regex;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 // 文件源结构体
 #[derive(Serialize)]
@@ -14,13 +18,6 @@ struct Source{
     name: String,
     data_a: String
 }
-// 索引更新数据结构体
-#[derive(Serialize)]
-struct IndexStat{
-    added: u32,
-    updated: u32,
-    removed: u32,
-}
 // 文件条目结构体
 #[derive(Serialize)]
 struct FileEntry{
@@ -29,6 +26,45 @@ struct FileEntry{
     size: i64,
     mtime: i64,
 }
+// 索引更新数据结构体
+#[derive(Serialize)]
+struct IndexStat{
+    added: u32,
+    updated: u32,
+    removed: u32,
+    works: u32,      // 刮削匹配到的作品数
+    scraped: u32,    // 刮削成功的文件数
+    unmatched: u32,  // 刮削未匹配的文件数
+}
+// 一部作品的刮削结果（网络阶段产出，落库阶段写入）
+struct WorkScrape{
+    tmdb_id: i64,
+    kind: &'static str,               // "tv" / "movie"
+    title: String,
+    poster: Option<String>,
+    rating: Option<f64>,
+    air_date: Option<String>,
+    region: Option<String>,
+    certification: Option<String>,
+    total_seasons: Option<i64>,
+    total_episodes: Option<i64>,
+    overview: Option<String>,        // 简介（搜索结果的 overview）
+    backdrop: Option<String>,        // 背景图链接（backdrop_path）
+    episodes: Vec<(i64, u32, u32, String, Option<String>, Option<String>)>, // (file_id, 季, 集, 分集标题, 分集封面, 分集简介)
+    season_meta: Vec<(u32, Option<String>, Option<String>)>, // (季, 季名, 季海报)
+}
+// ==================== TMDB 刮削 ====================
+const TMDB_API: &str = "https://api.themoviedb.org/3";
+const TMDB_API_ALT: &str = "https://tmdb.skylare.me/api/3";
+const TMDB_IMG: &str = "https://image.tmdb.org/t/p/original";
+const TMDB_IMG_ALT: &str = "https://tmdb.skylare.me/image/t/p/original";
+// 发布标签：清洗文件名时按词丢弃
+const NAME_TAGS: &[&str] = &["1080p","2160p","720p","480p","576p","4k","8k","1920","2160","1280",
+    "x264","x265","h264","h265","hevc","avc","av1","aac","flac","dts","truehd","eac3","ddp","atmos",
+    "hdr","hdr10","dv","dovi","remux","bluray","webdl","webrip","web","hdtv","dvdrip","10bit","8bit"];
+// 上次成功连上的镜像（false=主站，true=备用）；网络层失败时自动切换
+static USE_ALT: AtomicBool = AtomicBool::new(false);
+const TMDB_DELAY_MS: u64 = 500;   // 相邻两次请求的最小间隔，被风控就调大
 
 // 数据库初始化
 fn init_db(db: &Connection)->Result<(), String>{
@@ -56,7 +92,29 @@ fn init_db(db: &Connection)->Result<(), String>{
             size     INTEGER NOT NULL,      -- 字节数
             mtime    INTEGER NOT NULL,      -- 修改时间（Unix 秒）
             UNIQUE(lib_id, rel_path)
-        );",).map_err(|e|e.to_string())
+        );",).map_err(|e|e.to_string())?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS settings (
+            key      TEXT PRIMARY KEY,
+            value    TEXT NOT NULL
+        );",).map_err(|e|e.to_string())?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS works (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            tmdb_id        INTEGER NOT NULL,          -- TMDB 作品 id
+            kind           TEXT NOT NULL,             -- tv / movie
+            title          TEXT NOT NULL,             -- 作品名称
+            poster         TEXT,                      -- 作品封面链接
+            rating         REAL,                      -- 评分
+            air_date       TEXT,                      -- 播放日期
+            region         TEXT,                      -- 地区
+            certification  TEXT,                      -- 分级
+            total_seasons  INTEGER,                   -- 总季数（电影为 0）
+            total_episodes INTEGER,                   -- 总集数（电影为 1）
+            overview       TEXT,                      -- 简介
+            backdrop       TEXT,
+            seasons        TEXT NOT NULL DEFAULT '[]',-- JSON:[{season, name, poster, episodes:[{file_id, episode, title, still}]}]
+            UNIQUE(tmdb_id, kind)
+        );",).map_err(|e|e.to_string())?;
+    Ok(())
 }
 
 // 打开数据库
@@ -141,7 +199,8 @@ fn write_index(db: &mut Connection, id: i64, files: &[(String, &'static str, i64
         }
     }
     tx.commit().map_err(|e|e.to_string())?;
-    Ok(IndexStat{added, updated, removed})
+    prune_works(db)?;
+    Ok(IndexStat{added, updated, removed, works: 0, scraped: 0, unmatched: 0})
 }
 // URL百分号解码
 fn percent_decode(s: &str)->String{
@@ -222,6 +281,494 @@ async fn webdav_propfind(client: &reqwest::Client, url: &str, user: &str, pass: 
     let xml = resp.text().await.map_err(|e|e.to_string())?;
     parse_multistatus(&xml)
 }
+// 从 settings 表读 API Key
+fn get_tmdb_key(db: &Connection)->Result<String, String>{
+    let key: Option<String> = db.query_row("SELECT value FROM settings WHERE key = 'tmdb_api_key'", [], |r| r.get(0))
+        .optional().map_err(|e|e.to_string())?;
+    let key = key.unwrap_or_default().trim().to_string();
+    if key.is_empty() { Err("请先在设置中填写 TMDB API Key".into()) } else { Ok(key) }
+}
+
+// GET https://api.themoviedb.org/3{path}，用 Read Access Token 走 Bearer 鉴权
+// GET {base}{path}，用 Read Access Token 走 Bearer 鉴权；主站连不上自动换 TMDB_API_ALT
+async fn tmdb_get(client: &reqwest::Client, key: &str, path: &str, query: &[(&str, String)])->Result<Value, String>{
+    let use_alt = USE_ALT.load(Ordering::Relaxed);
+    let first = if use_alt { TMDB_API_ALT } else { TMDB_API };
+    let second = if use_alt { TMDB_API } else { TMDB_API_ALT };
+    let mut err = String::new();
+    for base in [first, second] {
+        println!("Using {}",base);
+        tokio::time::sleep(std::time::Duration::from_millis(TMDB_DELAY_MS)).await;
+        match client.get(format!("{}{}", base, path)).bearer_auth(key).query(query).send().await {
+            Ok(resp) => {
+                USE_ALT.store(base == TMDB_API_ALT, Ordering::Relaxed);   // 记住这次连通的
+                return if resp.status().is_success() {
+                    resp.json::<Value>().await.map_err(|e| e.to_string())
+                } else {
+                    Err(format!("TMDB 返回 {}", resp.status().as_u16()))
+                };
+            }
+            Err(e) => {
+                err = if e.is_timeout() { "TMDB 请求超时".to_string() } else { format!("无法连接 TMDB：{}", e) };
+            }
+        }
+    }
+    Err(format!("{}（主站和镜像均不可达）", err))
+}
+
+// TMDB 图片相对路径（如 /abc.jpg）：库里只存这个，图床主机下载时再拼
+fn img_path(v: &Value)->Option<String>{
+    let p = v.as_str()?;
+    if p.is_empty() { None } else { Some(p.to_string()) }
+}
+
+// 去掉 (...)、[...]、{...} 段（一般是发布组/编码信息）
+fn strip_brackets(s: &str)->String{
+    let mut out = String::with_capacity(s.len());
+    let mut depth = 0u32;
+    for c in s.chars() {
+        match c {
+            '(' | '[' | '{' => { depth += 1; out.push(' '); }
+            ')' | ']' | '}' => { depth = depth.saturating_sub(1); }
+            _ => out.push(if depth == 0 { c } else { ' ' }),
+        }
+    }
+    out
+}
+
+// 文件名 → (标题猜测, 年份, (季,集))；无集号视为电影，裸集数默认第 1 季
+fn parse_media_name(rel: &str)->(String, Option<i64>, Option<(u32,u32)>){
+    static RE_SE: OnceLock<Regex> = OnceLock::new();     // S01E02
+    static RE_X: OnceLock<Regex> = OnceLock::new();      // 1x02
+    static RE_CN: OnceLock<Regex> = OnceLock::new();     // 第3季…第12集
+    static RE_EP: OnceLock<Regex> = OnceLock::new();     // EP12 / E12 / 第12集
+    static RE_BR: OnceLock<Regex> = OnceLock::new();     // [03] 方括号裸集数
+    static RE_DASH: OnceLock<Regex> = OnceLock::new();   // " - 12"
+    static RE_SEASON: OnceLock<Regex> = OnceLock::new(); // 裸季号 S2 / 第2季
+    static RE_YEAR: OnceLock<Regex> = OnceLock::new();   // 年份
+    let re_se = RE_SE.get_or_init(|| Regex::new(r"(?i)S(\d{1,2})[\s._-]*E(\d{1,3})").unwrap());
+    let re_x  = RE_X.get_or_init(|| Regex::new(r"(?i)(?:^|[^0-9])(\d{1,2})x(\d{2,3})(?:$|[^0-9])").unwrap());
+    let re_cn = RE_CN.get_or_init(|| Regex::new(r"第\s*(\d{1,2})\s*季.*?第\s*(\d{1,3})\s*[集话話]").unwrap());
+    let re_ep = RE_EP.get_or_init(|| Regex::new(r"(?i)(?:^|[^0-9A-Za-z])(?:EP?|第)[\s._-]*(\d{1,3})[\s._-]*(?:[集话話])?").unwrap());
+    let re_br = RE_BR.get_or_init(|| Regex::new(r"\[(\d{2,3})\]").unwrap());
+    let re_dash = RE_DASH.get_or_init(|| Regex::new(r"-[\s._]*(\d{1,3})(?:$|[\s._\[(])").unwrap());
+    let re_season = RE_SEASON.get_or_init(|| Regex::new(r"(?i)S(\d{1,2})|第\s*(\d{1,2})\s*季").unwrap());
+    let re_year = RE_YEAR.get_or_init(|| Regex::new(r"(?:^|[^0-9])((?:19|20)\d{2})(?:$|[^0-9xp])").unwrap());
+
+    let file = rel.rsplit('/').next().unwrap_or(rel);
+    let stem = file.rsplit_once('.').map(|(s,_)| s).unwrap_or(file);
+    // 季集号：标题取季集号之前的部分
+    let (mut head, mut se) = if let Some(c) = re_se.captures(stem) {
+        let m = c.get(0).unwrap();
+        (stem[..m.start()].to_string(), Some((c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0))))
+    } else if let Some(c) = re_x.captures(stem) {
+        let m = c.get(0).unwrap();
+        (stem[..m.start()].to_string(), Some((c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0))))
+    } else if let Some(c) = re_cn.captures(stem) {
+        let m = c.get(0).unwrap();
+        (stem[..m.start()].to_string(), Some((c[1].parse().unwrap_or(0), c[2].parse().unwrap_or(0))))
+    } else {
+        (stem.to_string(), None)
+    };
+    // 裸集数（EP12 / E12 / 第12集 / " - 12"）：季号单独找（S2 / 第2季），没有就默认第 1 季
+    if se.is_none() {
+        let ep = re_ep.captures(stem).map(|c| (c.get(0).unwrap().start(), c[1].parse::<u32>().unwrap_or(0)))
+            .or_else(|| re_dash.captures(stem).map(|c| (c.get(0).unwrap().start(), c[1].parse::<u32>().unwrap_or(0))))
+            .or_else(|| re_br.captures(stem).map(|c| (c.get(0).unwrap().start(), c[1].parse::<u32>().unwrap_or(0))));
+        if let Some((pos, e)) = ep {
+            let mut h = stem[..pos].to_string();
+            let mut s = 1u32;
+            if let Some(c) = re_season.captures(&h) {
+                s = c.get(1).or(c.get(2)).map(|m| m.as_str().parse().unwrap_or(1)).unwrap_or(1);
+                let m = c.get(0).unwrap();
+                h.replace_range(m.start()..m.end(), " ");
+            }
+            se = Some((s, e));
+            head = h;
+        }
+    }
+    // 抽出年份作为搜索过滤
+    let mut head = head;
+    let hit = re_year.captures(&head).and_then(|c| c.get(1).map(|m| (m.start(), m.end())));
+    let year = match hit {
+        Some((s, e)) => {
+            let y: Option<i64> = head[s..e].parse().ok();
+            head.replace_range(s..e, " ");
+            y
+        }
+        None => None,
+    };
+    // 去括号段、丢发布标签、合并空格
+    let title = strip_brackets(&head)
+        .split(|c: char| c == '.' || c == '_' || c == '-' || c.is_whitespace())
+        .filter(|w| !w.is_empty() && !NAME_TAGS.iter().any(|t| t.eq_ignore_ascii_case(w)))
+        .collect::<Vec<_>>().join(" ");
+    (title, year, se)
+}
+
+// 把一集合并进 seasons JSON：按季分组、按集数排序，同一 file_id 的旧条目先移除
+fn seasons_put(seasons: &mut Value, season: u32, file_id: i64, episode: u32, title: String, still: Option<String>, overview: Option<String>){
+    let Some(arr) = seasons.as_array_mut() else { return };
+    for g in arr.iter_mut() {
+        if let Some(eps) = g["episodes"].as_array_mut() {
+            eps.retain(|e| e["file_id"].as_i64() != Some(file_id));
+        }
+    }
+    let idx = match arr.iter().position(|g| g["season"].as_i64() == Some(season as i64)) {
+        Some(i) => i,
+        None => { arr.push(json!({ "season": season, "episodes": [] })); arr.len() - 1 }
+    };
+    let Some(eps) = arr[idx]["episodes"].as_array_mut() else { return };
+    eps.push(json!({ "file_id": file_id, "episode": episode, "title": title, "still": still, "overview": overview }));
+    eps.sort_by_key(|e| e["episode"].as_i64().unwrap_or(0));
+}
+
+// 剧集分级：CN 优先，其次 US，否则任一非空
+fn tv_certification(cr: &Value)->Option<String>{
+    let arr = cr["results"].as_array()?;
+    for cc in ["CN", "US"] {
+        if let Some(s) = arr.iter().find(|r| r["iso_3166_1"].as_str() == Some(cc)).and_then(|r| r["rating"].as_str()) {
+            return Some(s.to_string())
+        }
+    }
+    arr.iter().find_map(|r| r["rating"].as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string())
+}
+// 电影分级：release_dates 里优先 CN/US 的 certification
+fn movie_certification(rd: &Value)->Option<String>{
+    let arr = rd["results"].as_array()?;
+    for cc in ["CN", "US"] {
+        let rds = arr.iter().find(|r| r["iso_3166_1"].as_str() == Some(cc))
+            .and_then(|r| r["release_dates"].as_array()).map(|a| a.as_slice()).unwrap_or(&[]);
+        if let Some(s) = rds.iter().find_map(|d| d["certification"].as_str()).filter(|s| !s.is_empty()) {
+            return Some(s.to_string())
+        }
+    }
+    arr.iter().flat_map(|r| r["release_dates"].as_array().map(|a| a.iter()).into_iter().flatten())
+        .find_map(|d| d["certification"].as_str()).filter(|s| !s.is_empty()).map(|s| s.to_string())
+}
+// 刮削前清理：删掉本文件源所有文件的旧刮削条目（改过名的文件换了 id，旧条目不会再被覆盖到），
+//条目清空的作品行一并删除；其他文件源的条目不受影响
+fn clear_scrape_of_source(db: &Connection, id: i64)->Result<(), String>{
+    let src: HashSet<i64> = {
+        let mut stmt = db.prepare("SELECT id FROM files WHERE lib_id = ?1").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map(params![id], |r| r.get(0)).map_err(|e|e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e|e.to_string())?
+    };
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = db.prepare("SELECT id, seasons FROM works").map_err(|e|e.to_string())?;
+        let rs = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e|e.to_string())?;
+        rs.collect::<Result<_,_>>().map_err(|e|e.to_string())?
+    };
+    for (wid, old) in rows {
+        let mut seasons: Value = serde_json::from_str(&old).unwrap_or_else(|_| json!([]));
+        if let Some(arr) = seasons.as_array_mut() {
+            for g in arr.iter_mut() {
+                if let Some(eps) = g["episodes"].as_array_mut() {
+                    eps.retain(|e| e["file_id"].as_i64().map(|f| !src.contains(&f)).unwrap_or(true));
+                }
+            }
+            arr.retain(|g| g["episodes"].as_array().map(|a| !a.is_empty()).unwrap_or(true));
+        }
+        if seasons.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+            db.execute("DELETE FROM works WHERE id = ?1", params![wid]).map_err(|e|e.to_string())?;  // 空壳作品删行
+        } else {
+            db.execute("UPDATE works SET seasons = ?1 WHERE id = ?2", params![seasons.to_string(), wid]).map_err(|e|e.to_string())?;
+        }
+    }
+    Ok(())
+}
+// 清掉 works.seasons 里指向已删文件的分集
+fn prune_works(db: &Connection)->Result<(), String>{
+    let live: HashSet<i64> = {
+        let mut stmt = db.prepare("SELECT id FROM files").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map([], |r| r.get(0)).map_err(|e|e.to_string())?;
+        rows.collect::<Result<_,_>>().map_err(|e|e.to_string())?
+    };
+    let rows: Vec<(i64, String)> = {
+        let mut stmt = db.prepare("SELECT id, seasons FROM works").map_err(|e|e.to_string())?;
+        let rs = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).map_err(|e|e.to_string())?;
+        rs.collect::<Result<_,_>>().map_err(|e|e.to_string())?
+    };
+    for (wid, old) in rows {
+        let mut seasons: Value = serde_json::from_str(&old).unwrap_or_else(|_| json!([]));
+        let mut changed = false;
+        if let Some(arr) = seasons.as_array_mut() {
+            for g in arr.iter_mut() {
+                if let Some(eps) = g["episodes"].as_array_mut() {
+                    let before = eps.len();
+                    eps.retain(|e| e["file_id"].as_i64().map(|f| live.contains(&f)).unwrap_or(false));
+                    if eps.len() != before { changed = true }
+                }
+            }
+            let before = arr.len();
+            arr.retain(|g| g["episodes"].as_array().map(|a| !a.is_empty()).unwrap_or(true));
+            if arr.len() != before { changed = true }
+        }
+        if changed {
+            if seasons.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+                db.execute("DELETE FROM works WHERE id = ?1", params![wid]).map_err(|e|e.to_string())?;
+            } else {
+                db.execute("UPDATE works SET seasons = ?1 WHERE id = ?2", params![seasons.to_string(), wid]).map_err(|e|e.to_string())?;
+            }
+        }
+    }
+    Ok(())
+}
+// 匹配一部剧，拉作品/分集详情，返回 None 表示没搜到
+async fn fetch_tv(client: &reqwest::Client, key: &str, title: &str, year: Option<i64>, files: &[(i64, Option<(u32,u32)>)])->Result<Option<WorkScrape>, String>{
+    // 搜索（query 只有标题，季集号不进 query；带年份搜不到就去掉年份重搜）
+    let mut q = vec![("query", title.to_string()), ("language", "zh-CN".to_string())];
+    if let Some(y) = year { q.push(("first_air_date_year", y.to_string())); }
+    let mut results = tmdb_get(client, key, "/search/tv", &q).await?.get("results").cloned().unwrap_or(Value::Null);
+    if results.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        let q2 = vec![("query", title.to_string()), ("language", "zh-CN".to_string())];
+        results = tmdb_get(client, key, "/search/tv", &q2).await?.get("results").cloned().unwrap_or(Value::Null);
+    }
+    let Some(hit) = results.get(0) else { return Ok(None) };
+    let tv_id = hit["id"].as_i64().ok_or("TMDB 搜索结果缺少 id")?;
+
+    // 电视剧详情
+    let detail = tmdb_get(client, key, &format!("/tv/{}", tv_id), &[("language", "zh-CN".to_string())]).await?;
+    let ratings = tmdb_get(client, key, &format!("/tv/{}/content_ratings", tv_id), &[]).await?;
+    let name = detail["name"].as_str().unwrap_or(title).to_string();
+    let poster = img_path(&detail["poster_path"]);
+    let rating = detail["vote_average"].as_f64();
+    let air_date = detail["first_air_date"].as_str().map(|s| s.to_string());
+    let region = detail["origin_country"].get(0).and_then(|v| v.as_str()).map(|s| s.to_string());
+    let total_seasons = detail["number_of_seasons"].as_i64();
+    let total_episodes = detail["number_of_episodes"].as_i64();
+    let certification = tv_certification(&ratings);
+    let overview = hit["overview"].as_str().map(|s| s.to_string());
+    let backdrop = img_path(&hit["backdrop_path"]);
+
+    // 当季详情：每个出现过的季拉一次，拿季名/季海报
+    let mut season_map: HashMap<u32, (Option<String>, Option<String>)> = HashMap::new();
+    for &(_, se) in files {
+        let Some((season, _)) = se else { continue };
+        if season_map.contains_key(&season) { continue }
+        let meta = if let Ok(s) = tmdb_get(client, key, &format!("/tv/{}/season/{}", tv_id, season),
+                                           &[("language", "zh-CN".to_string())]).await {
+            (s["name"].as_str().map(|x| x.to_string()), img_path(&s["poster_path"]))
+        } else { (None, None) };
+        season_map.insert(season, meta);
+    }
+    // 单集详情：逐文件按 parse 的季/集拉，拿分集标题/封面
+    let mut episodes = Vec::new();
+    for &(fid, se) in files {
+        let Some((season, ep)) = se else { continue };
+        if let Ok(e) = tmdb_get(client, key, &format!("/tv/{}/season/{}/episode/{}", tv_id, season, ep),
+                                &[("language", "zh-CN".to_string())]).await {
+            episodes.push((fid, season, ep, e["name"].as_str().unwrap_or("").to_string(), img_path(&e["still_path"]),
+                           e["overview"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string())));
+        }
+    }
+    if episodes.is_empty() { return Ok(None) }
+    let season_meta: Vec<(u32, Option<String>, Option<String>)> =
+        season_map.into_iter().map(|(sn, (name, poster))| (sn, name, poster)).collect();
+    Ok(Some(WorkScrape{ tmdb_id: tv_id, kind: "tv", title: name, poster, rating, air_date, region,
+        certification, total_seasons, total_episodes, overview, backdrop, episodes, season_meta }))
+}
+
+// 匹配一部电影；一文件一条分集，单集封面按需求留空
+async fn fetch_movie(client: &reqwest::Client, key: &str, title: &str, year: Option<i64>, files: &[i64])->Result<Option<WorkScrape>, String>{
+    let mut q = vec![("query", title.to_string()), ("language", "zh-CN".to_string())];
+    if let Some(y) = year { q.push(("year", y.to_string())); }
+    let mut results = tmdb_get(client, key, "/search/movie", &q).await?.get("results").cloned().unwrap_or(Value::Null);
+    if results.as_array().map(|a| a.is_empty()).unwrap_or(true) {
+        let q2 = vec![("query", title.to_string()), ("language", "zh-CN".to_string())];
+        results = tmdb_get(client, key, "/search/movie", &q2).await?.get("results").cloned().unwrap_or(Value::Null);
+    }
+    let Some(hit) = results.get(0) else { return Ok(None) };
+    let movie_id = hit["id"].as_i64().ok_or("TMDB 搜索结果缺少 id")?;
+
+    let detail = tmdb_get(client, key, &format!("/movie/{}", movie_id), &[("language", "zh-CN".to_string())]).await?;
+    let dates = tmdb_get(client, key, &format!("/movie/{}/release_dates", movie_id), &[]).await?;
+    let name = detail["title"].as_str().unwrap_or(title).to_string();
+    let poster = img_path(&detail["poster_path"]);
+    let rating = detail["vote_average"].as_f64();
+    let air_date = detail["release_date"].as_str().map(|s| s.to_string());
+    let region = detail["production_countries"].get(0).and_then(|c| c["iso_3166_1"].as_str()).map(|s| s.to_string());
+    let certification = movie_certification(&dates);
+    let overview = hit["overview"].as_str().map(|s| s.to_string());
+    let backdrop = img_path(&hit["backdrop_path"]);
+
+    let episodes: Vec<(i64, u32, u32, String, Option<String>, Option<String>)> =
+        files.iter().map(|&fid| (fid, 0u32, 0u32, name.clone(), None, None)).collect();   // 封面/简介留空
+    Ok(Some(WorkScrape{ tmdb_id: movie_id, kind: "movie", title: name, poster, rating, air_date, region,
+        certification, total_seasons: Some(0), total_episodes: Some(1), overview, backdrop,
+        episodes, season_meta: Vec::new() }))
+}
+// 把一部作品合并进 works 表：读旧 seasons → 按 file_id 合并 → 写回
+fn apply_work(db: &Connection, w: &WorkScrape)->Result<(), String>{
+    let old: Option<String> = db
+        .query_row("SELECT seasons FROM works WHERE tmdb_id = ?1 AND kind = ?2", params![w.tmdb_id, w.kind], |r| r.get(0))
+        .optional().map_err(|e|e.to_string())?;
+    let mut seasons: Value = old.and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_else(|| json!([]));
+    for (fid, season, ep, title, still, overview) in &w.episodes {
+        seasons_put(&mut seasons, *season, *fid, *ep, title.clone(), still.clone(), overview.clone());
+    }
+    // 当季详情写进对应季分组
+    if let Some(arr) = seasons.as_array_mut() {
+        for (sn, name, poster) in &w.season_meta {
+            if let Some(g) = arr.iter_mut().find(|g| g["season"].as_i64() == Some(*sn as i64)) {
+                g["name"] = json!(name);
+                g["poster"] = json!(poster);
+            }
+        }
+    }
+    if let Some(arr) = seasons.as_array_mut() {
+        arr.retain(|g| g["episodes"].as_array().map(|a| !a.is_empty()).unwrap_or(true));
+        arr.sort_by_key(|g| g["season"].as_i64().unwrap_or(0));
+    }
+    db.execute("INSERT INTO works
+            (tmdb_id,kind,title,poster,rating,air_date,region,certification,total_seasons,total_episodes,overview,backdrop,seasons)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+            ON CONFLICT(tmdb_id, kind) DO UPDATE SET title=excluded.title, poster=excluded.poster, rating=excluded.rating,
+                air_date=excluded.air_date, region=excluded.region, certification=excluded.certification,
+                total_seasons=excluded.total_seasons, total_episodes=excluded.total_episodes,
+                overview=excluded.overview, backdrop=excluded.backdrop, seasons=excluded.seasons",
+               params![w.tmdb_id, w.kind, w.title, w.poster, w.rating, w.air_date, w.region, w.certification,
+                w.total_seasons, w.total_episodes, w.overview, w.backdrop, seasons.to_string()])
+        .map_err(|e|e.to_string())?;
+    Ok(())
+}
+
+// 同步：读源下视频文件，按 (标题小写, 是否剧集) 分组，减少 TMDB 搜索次数
+fn load_scrape_groups(db: &Connection, id: i64)->Result<HashMap<(String, bool), Vec<(i64, Option<i64>, Option<(u32,u32)>)>>, String>{
+    let mut stmt = db.prepare("SELECT id, rel_path FROM files WHERE lib_id = ?1 AND type = 'video'").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map(params![id], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
+    let files: Vec<(i64, String)> = rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())?;
+    let mut groups = HashMap::new();
+    for (fid, rel) in files {
+        let (title, year, se) = parse_media_name(&rel);
+        groups.entry((title.to_lowercase(), se.is_some())).or_insert_with(Vec::new).push((fid, year, se));
+    }
+    Ok(groups)
+}
+
+// 扫描完自动刮削整个文件源，返回 (作品数, 刮削成功文件数, 未匹配文件数)
+// 分三段：同步读库 → 异步请求 TMDB → 同步写库（连接不跨 await）
+// 没配 API Key 时直接跳过；刮削失败不影响扫描结果
+async fn scrape_source_files(app: tauri::AppHandle, id: i64)->Result<(u32, u32, u32), String>{
+    let (key, groups) = {
+        let db = open_db(&app)?;
+        let Ok(key) = get_tmdb_key(&db) else { return Ok((0, 0, 0)) };
+        (key, load_scrape_groups(&db, id)?)
+    };
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build().map_err(|e|e.to_string())?;
+    let mut works = Vec::new();
+    let (mut done, mut unmatched) = (0u32, 0u32);
+    for ((title, is_tv), items) in groups {
+        let year = items.iter().find_map(|(_, y, _)| *y);
+        let fids: Vec<i64> = items.iter().map(|(f, _, _)| *f).collect();
+        let r = if is_tv {
+            let fs: Vec<(i64, Option<(u32,u32)>)> = items.iter().map(|(f, _, se)| (*f, *se)).collect();
+            match fetch_tv(&client, &key, &title, year, &fs).await {
+                Ok(None) => fetch_movie(&client, &key, &title, year, &fids).await,
+                other => other,
+            }
+        } else {
+            fetch_movie(&client, &key, &title, year, &fids).await
+        };
+        match r {
+            Ok(Some(w)) => {
+                let n = w.episodes.len() as u32;
+                done += n;
+                unmatched += items.len() as u32 - n;
+                works.push(w);
+            }
+            Ok(None) => { unmatched += items.len() as u32; }   // 没搜到
+            Err(e) => {                                        // 请求失败：打出来才好排查
+                println!("[刮削失败] {}：{}", title, e);
+                unmatched += items.len() as u32;
+            }
+        }
+    }
+    {
+        let db = open_db(&app)?;
+        clear_scrape_of_source(&db, id)?;
+        for w in &works { apply_work(&db, w)?; }
+    }
+    // 刮削完构建图片缓存（失败不影响刮削结果）
+    cache_images(app).await.unwrap_or_else(|e| { println!("[图片缓存] {}", e); 0 });
+    Ok((works.len() as u32, done, unmatched))
+}
+// ==================== 图片缓存 ====================
+// 上次成功连上的图床（false=TMDB_IMG，true=TMDB_IMG_ALT）
+static IMG_USE_ALT: AtomicBool = AtomicBool::new(false);
+
+// 缓存目录：和数据库同级的 img_cache/
+fn img_cache_dir(app: &tauri::AppHandle)->std::path::PathBuf {
+    app.path().app_data_dir().expect("配置目录不可用").join("img_cache")
+}
+
+// 收集 works 表里所有图片相对路径：poster / backdrop / 各季海报 / 各集封面
+fn collect_image_paths(db: &Connection)->Result<HashSet<String>, String>{
+    let mut paths = HashSet::new();
+    let mut stmt = db.prepare("SELECT poster, backdrop, seasons FROM works").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_,Option<String>>(0)?, r.get::<_,Option<String>>(1)?, r.get::<_,String>(2)?))).map_err(|e|e.to_string())?;
+    for row in rows {
+        let (poster, backdrop, seasons) = row.map_err(|e|e.to_string())?;
+        for p in poster.into_iter().chain(backdrop) { paths.insert(p); }
+        let v: Value = serde_json::from_str(&seasons).unwrap_or_else(|_| json!([]));
+        for g in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            if let Some(p) = g["poster"].as_str() { paths.insert(p.to_string()); }
+            for e in g["episodes"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if let Some(p) = e["still"].as_str() { paths.insert(p.to_string()); }
+            }
+        }
+    }
+    Ok(paths)
+}
+
+// 下载一张图：主图床失败自动换 TMDB_IMG_ALT，记住能连上的
+async fn fetch_img(client: &reqwest::Client, path: &str)->Result<Vec<u8>, String>{
+    let use_alt = IMG_USE_ALT.load(Ordering::Relaxed);
+    let first = if use_alt { TMDB_IMG_ALT } else { TMDB_IMG };
+    let second = if use_alt { TMDB_IMG } else { TMDB_IMG_ALT };
+    let mut err = String::new();
+    for base in [first, second] {
+        println!("Using {}",base);
+        tokio::time::sleep(std::time::Duration::from_millis(TMDB_DELAY_MS)).await;
+        match client.get(format!("{}{}", base, path)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                IMG_USE_ALT.store(base == TMDB_IMG_ALT, Ordering::Relaxed);
+                return resp.bytes().await.map(|b| b.to_vec()).map_err(|e| e.to_string());
+            }
+            Ok(resp) => { err = format!("图床返回 {}", resp.status().as_u16()); }   // 失败也换个图床试试
+            Err(e) => {
+                err = if e.is_timeout() { "图片下载超时".to_string() } else { format!("无法连接图床：{}", e) };
+            }
+        }
+    }
+    Err(err)
+}
+
+// 刮削完把图片下到本地缓存；已缓存的跳过，单张失败不影响整体，返回成功张数
+async fn cache_images(app: tauri::AppHandle)->Result<u32, String>{
+    let (dir, paths) = {
+        let db = open_db(&app)?;
+        (img_cache_dir(&app), collect_image_paths(&db)?)
+    };
+    let _ = fs::create_dir_all(&dir);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build().map_err(|e|e.to_string())?;
+    let mut ok = 0u32;
+    for path in paths {
+        // 相对路径形如 /abc.jpg，缓存文件名直接用 abc.jpg
+        let Some(name) = path.rsplit('/').next().filter(|s| !s.is_empty()) else { continue };
+        let file = dir.join(name);
+        if file.exists() { ok += 1; continue }
+        tokio::time::sleep(std::time::Duration::from_millis(TMDB_DELAY_MS)).await;
+        if let Ok(bytes) = fetch_img(&client, &path).await {
+            if fs::write(&file, &bytes).is_ok() { ok += 1 }
+        }
+    }
+    Ok(ok)
+}
 // 添加本地文件源
 #[tauri::command]
 async fn add_local_source(app: tauri::AppHandle)->Result<Option<i64>, String>{
@@ -260,7 +807,13 @@ async fn index_local_source(app: tauri::AppHandle, id: i64)->Result<IndexStat, S
     let root = std::path::Path::new(&root_str);
     let mut files = Vec::new();
     scan_local_files(root, root, &mut files);
-    write_index(&mut db,id,&files)
+    let mut stat = write_index(&mut db,id,&files)?;
+    drop(db);   // 让连接在 await 前释放
+    let (works, scraped, unmatched) = scrape_source_files(app, id).await.unwrap_or_else(|e| { println!("[刮削] {}", e); (0, 0, 0) });
+    stat.works = works;
+    stat.scraped = scraped;
+    stat.unmatched = unmatched;
+    Ok(stat)
 }
 // 添加WebDAV文件源
 #[tauri::command]
@@ -279,7 +832,7 @@ async fn test_webdav_source(host: String, port: u16, https: bool, username: Stri
     let path = if path.starts_with('/') { path } else { format!("/{}", path) };
     let url = format!("{}://{}:{}{}", if https {"https"} else {"http"}, host, port, path);
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
         .build().map_err(|e|e.to_string())?;
     let method = reqwest::Method::from_bytes(b"PROPFIND").map_err(|e|e.to_string())?;
     let mut req = client.request(method, &url)
@@ -302,6 +855,7 @@ async fn test_webdav_source(host: String, port: u16, https: bool, username: Stri
 // 扫描WebDAV文件源
 #[tauri::command]
 async fn index_webdav_source(app: tauri::AppHandle, id: i64)->Result<IndexStat, String>{
+    println!("index_start");
     let mut db = open_db(&app)?;
     let (root_url, user, pass): (String, String, String) = db
         .query_row("SELECT data_a, data_e, data_f FROM sources WHERE id = ?1", params![id],
@@ -337,7 +891,16 @@ async fn index_webdav_source(app: tauri::AppHandle, id: i64)->Result<IndexStat, 
             }
         }
     }
-    write_index(&mut db, id, &out)
+    let mut stat = write_index(&mut db, id, &out)?;
+    println!("index_complete");
+    drop(db);
+    println!("scrape_start");
+    let (works, scraped, unmatched) = scrape_source_files(app, id).await.unwrap_or((0, 0, 0));
+    println!("scrape_complete");
+    stat.works = works;
+    stat.scraped = scraped;
+    stat.unmatched = unmatched;
+    Ok(stat)
 }
 // 列出文件源下已索引的文件
 #[tauri::command]
@@ -352,13 +915,29 @@ fn list_files(app: tauri::AppHandle, id: i64)->Result<Vec<FileEntry>, String>{
     })).map_err(|e|e.to_string())?;
     rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
 }
+// 读取设置
+#[tauri::command]
+fn get_setting(app: tauri::AppHandle, key: String)->Result<Option<String>, String>{
+    let db = open_db(&app)?;
+    let v:Option<String> = db.query_row("SELECT value FROM settings WHERE key = ?1",params![key],|r| r.get(0)).optional().map_err(|e|e.to_string())?;
+    Ok(v)
+}
+// 写入设置
+#[tauri::command]
+fn set_setting(app: tauri::AppHandle, key: String, value: String)->Result<(), String>{
+    let db = open_db(&app)?;
+    db.execute("INSERT INTO settings (key,value) VALUES (?1,?2)
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+               params![key, value]).map_err(|e|e.to_string())?;
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files])
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
