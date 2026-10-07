@@ -1,5 +1,5 @@
 <script setup>
-import {ref, computed, onMounted, nextTick} from 'vue'
+import {ref, computed, onMounted} from 'vue'
 import { invoke, convertFileSrc } from '@tauri-apps/api/core'
 import { useRouter } from 'vue-router'
 import { usePageScroller } from './scroll.js'
