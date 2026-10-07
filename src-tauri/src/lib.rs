@@ -49,9 +49,71 @@ struct WorkScrape{
     total_seasons: Option<i64>,
     total_episodes: Option<i64>,
     overview: Option<String>,        // 简介（搜索结果的 overview）
-    backdrop: Option<String>,        // 背景图链接（backdrop_path）
+    backdrop: Option<String>, // 背景图链接（backdrop_path）
+    genres: Vec<String>,
+    cast: Value,
     episodes: Vec<(i64, u32, u32, String, Option<String>, Option<String>)>, // (file_id, 季, 集, 分集标题, 分集封面, 分集简介)
     season_meta: Vec<(u32, Option<String>, Option<String>)>, // (季, 季名, 季海报)
+}
+// 媒体库：作品条目
+#[derive(Serialize)]
+struct WorkItem{
+    tmdb_id: i64,
+    kind: String,             // tv / movie
+    title: String,
+    poster: Option<String>,   // 已缓存封面的本地绝对路径；没缓存到为 None
+    backdrop: Option<String>,
+    rating: Option<f64>,
+    air_date: Option<String>,
+    region: Option<String>,
+    certification: Option<String>,
+    overview: Option<String>,
+    total_seasons: Option<i64>,
+    total_episodes: Option<i64>,
+    genres: Vec<String>,
+}
+// 媒体库：未刮削条目
+#[derive(Serialize)]
+struct UnscrapedItem{
+    name: String,      // 文件名（去扩展名），用作标题
+    rel_path: String,
+}
+// 作品详情：分集条目
+#[derive(Serialize)]
+struct EpisodeItem{
+    file_id: i64,
+    season: u32,
+    episode: u32,
+    title: String,
+    still: Option<String>,   // 缓存绝对路径
+    size: i64,
+}
+// 演职人员条目
+#[derive(Serialize)]
+struct CastItem{
+    name: String,
+    character: String,
+    photo: Option<String>,   // 缓存绝对路径
+}
+// 作品详情
+#[derive(Serialize)]
+struct WorkDetail{
+    tmdb_id: i64,
+    kind: String,
+    title: String,
+    poster: Option<String>,
+    backdrop: Option<String>,
+    rating: Option<f64>,
+    air_date: Option<String>,
+    region: Option<String>,
+    certification: Option<String>,
+    overview: Option<String>,
+    total_seasons: Option<i64>,
+    total_episodes: Option<i64>,
+    genres: Vec<String>,
+    cast: Vec<CastItem>,
+    total_size: i64,
+    episodes: Vec<EpisodeItem>,
 }
 // ==================== TMDB 刮削 ====================
 const TMDB_API: &str = "https://api.themoviedb.org/3";
@@ -111,7 +173,9 @@ fn init_db(db: &Connection)->Result<(), String>{
             total_episodes INTEGER,                   -- 总集数（电影为 1）
             overview       TEXT,                      -- 简介
             backdrop       TEXT,
+            genres         TEXT NOT NULL DEFAULT '[]',
             seasons        TEXT NOT NULL DEFAULT '[]',-- JSON:[{season, name, poster, episodes:[{file_id, episode, title, still}]}]
+            cast_json      TEXT NOT NULL DEFAULT '[]',-- JSON：[{name, character, photo}]
             UNIQUE(tmdb_id, kind)
         );",).map_err(|e|e.to_string())?;
     Ok(())
@@ -538,8 +602,22 @@ async fn fetch_tv(client: &reqwest::Client, key: &str, title: &str, year: Option
     let total_seasons = detail["number_of_seasons"].as_i64();
     let total_episodes = detail["number_of_episodes"].as_i64();
     let certification = tv_certification(&ratings);
+    // 演职人员（取前 14 位，credits 本身按 order 排好）
+    let credits = tmdb_get(client, key, &format!("/tv/{}/credits", tv_id), &[("language", "zh-CN".to_string())]).await?;
+    let cast: Value = credits["cast"].as_array()
+        .map(|a| Value::Array(a.iter().filter_map(|c| {
+            Some(json!({
+                "name": c["name"].as_str()?,
+                "character": c["character"].as_str().unwrap_or(""),
+                "photo": img_path(&c["profile_path"]),
+            }))
+        }).collect()))
+        .unwrap_or_else(|| json!([]));
     let overview = hit["overview"].as_str().map(|s| s.to_string());
     let backdrop = img_path(&hit["backdrop_path"]);
+    let genres: Vec<String> = detail["genres"].as_array()
+        .map(|a| a.iter().filter_map(|g| g["name"].as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
 
     // 当季详情：每个出现过的季拉一次，拿季名/季海报
     let mut season_map: HashMap<u32, (Option<String>, Option<String>)> = HashMap::new();
@@ -566,7 +644,7 @@ async fn fetch_tv(client: &reqwest::Client, key: &str, title: &str, year: Option
     let season_meta: Vec<(u32, Option<String>, Option<String>)> =
         season_map.into_iter().map(|(sn, (name, poster))| (sn, name, poster)).collect();
     Ok(Some(WorkScrape{ tmdb_id: tv_id, kind: "tv", title: name, poster, rating, air_date, region,
-        certification, total_seasons, total_episodes, overview, backdrop, episodes, season_meta }))
+        certification, total_seasons, total_episodes, overview, backdrop, genres, cast, episodes, season_meta }))
 }
 
 // 匹配一部电影；一文件一条分集，单集封面按需求留空
@@ -589,13 +667,27 @@ async fn fetch_movie(client: &reqwest::Client, key: &str, title: &str, year: Opt
     let air_date = detail["release_date"].as_str().map(|s| s.to_string());
     let region = detail["production_countries"].get(0).and_then(|c| c["iso_3166_1"].as_str()).map(|s| s.to_string());
     let certification = movie_certification(&dates);
+    // 演职人员（取前 14 位，credits 本身按 order 排好）
+    let credits = tmdb_get(client, key, &format!("/movie/{}/credits", movie_id), &[("language", "zh-CN".to_string())]).await?;
+    let cast: Value = credits["cast"].as_array()
+        .map(|a| Value::Array(a.iter().take(14).filter_map(|c| {
+            Some(json!({
+                "name": c["name"].as_str()?,
+                "character": c["character"].as_str().unwrap_or(""),
+                "photo": img_path(&c["profile_path"]),
+            }))
+        }).collect()))
+        .unwrap_or_else(|| json!([]));
     let overview = hit["overview"].as_str().map(|s| s.to_string());
     let backdrop = img_path(&hit["backdrop_path"]);
+    let genres: Vec<String> = detail["genres"].as_array()
+        .map(|a| a.iter().filter_map(|g| g["name"].as_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
 
     let episodes: Vec<(i64, u32, u32, String, Option<String>, Option<String>)> =
         files.iter().map(|&fid| (fid, 0u32, 0u32, name.clone(), None, None)).collect();   // 封面/简介留空
     Ok(Some(WorkScrape{ tmdb_id: movie_id, kind: "movie", title: name, poster, rating, air_date, region,
-        certification, total_seasons: Some(0), total_episodes: Some(1), overview, backdrop,
+        certification, total_seasons: Some(0), total_episodes: Some(1), overview, backdrop, genres, cast,
         episodes, season_meta: Vec::new() }))
 }
 // 把一部作品合并进 works 表：读旧 seasons → 按 file_id 合并 → 写回
@@ -621,14 +713,14 @@ fn apply_work(db: &Connection, w: &WorkScrape)->Result<(), String>{
         arr.sort_by_key(|g| g["season"].as_i64().unwrap_or(0));
     }
     db.execute("INSERT INTO works
-            (tmdb_id,kind,title,poster,rating,air_date,region,certification,total_seasons,total_episodes,overview,backdrop,seasons)
-            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)
+            (tmdb_id,kind,title,poster,rating,air_date,region,certification,total_seasons,total_episodes,overview,backdrop,genres,cast_json,seasons)
+            VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
             ON CONFLICT(tmdb_id, kind) DO UPDATE SET title=excluded.title, poster=excluded.poster, rating=excluded.rating,
                 air_date=excluded.air_date, region=excluded.region, certification=excluded.certification,
                 total_seasons=excluded.total_seasons, total_episodes=excluded.total_episodes,
-                overview=excluded.overview, backdrop=excluded.backdrop, seasons=excluded.seasons",
+                overview=excluded.overview, backdrop=excluded.backdrop, cast_json=excluded.cast_json, seasons=excluded.seasons",
                params![w.tmdb_id, w.kind, w.title, w.poster, w.rating, w.air_date, w.region, w.certification,
-                w.total_seasons, w.total_episodes, w.overview, w.backdrop, seasons.to_string()])
+                w.total_seasons, w.total_episodes, w.overview, w.backdrop,json!(w.genres).to_string(), w.cast.to_string(), seasons.to_string()])
         .map_err(|e|e.to_string())?;
     Ok(())
 }
@@ -707,16 +799,20 @@ fn img_cache_dir(app: &tauri::AppHandle)->std::path::PathBuf {
 // 收集 works 表里所有图片相对路径：poster / backdrop / 各季海报 / 各集封面
 fn collect_image_paths(db: &Connection)->Result<HashSet<String>, String>{
     let mut paths = HashSet::new();
-    let mut stmt = db.prepare("SELECT poster, backdrop, seasons FROM works").map_err(|e|e.to_string())?;
-    let rows = stmt.query_map([], |r| Ok((r.get::<_,Option<String>>(0)?, r.get::<_,Option<String>>(1)?, r.get::<_,String>(2)?))).map_err(|e|e.to_string())?;
+    let mut stmt = db.prepare("SELECT poster, backdrop, cast_json, seasons FROM works").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_,Option<String>>(0)?, r.get::<_,Option<String>>(1)?, r.get::<_,String>(2)?, r.get::<_,String>(3)?))).map_err(|e|e.to_string())?;
     for row in rows {
-        let (poster, backdrop, seasons) = row.map_err(|e|e.to_string())?;
+        let (poster, backdrop, cast, seasons) = row.map_err(|e|e.to_string())?;
         for p in poster.into_iter().chain(backdrop) { paths.insert(p); }
         let v: Value = serde_json::from_str(&seasons).unwrap_or_else(|_| json!([]));
         for g in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
             if let Some(p) = g["poster"].as_str() { paths.insert(p.to_string()); }
             for e in g["episodes"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
                 if let Some(p) = e["still"].as_str() { paths.insert(p.to_string()); }
+            }
+            let cv: Value = serde_json::from_str(&cast).unwrap_or_else(|_| json!([]));
+            for c in cv.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if let Some(p) = c["photo"].as_str() { paths.insert(p.to_string()); }
             }
         }
     }
@@ -931,13 +1027,139 @@ fn set_setting(app: tauri::AppHandle, key: String, value: String)->Result<(), St
                params![key, value]).map_err(|e|e.to_string())?;
     Ok(())
 }
+// 媒体库：已刮削作品（每部一行）
+#[tauri::command]
+fn list_works(app: tauri::AppHandle)->Result<Vec<WorkItem>, String>{
+    let db = open_db(&app)?;
+    let dir = img_cache_dir(&app);
+    // 相对路径 → img_cache 绝对路径；没下到图返回 None
+    let cached = |p: &Option<String>| -> Option<String> {
+        p.as_ref().map(|p| dir.join(p.rsplit('/').next().unwrap_or("")))
+            .filter(|f| f.exists() && f.is_file())
+            .map(|f| f.to_string_lossy().to_string())
+    };
+    let mut stmt = db.prepare("SELECT tmdb_id, kind, title, poster, backdrop, rating, air_date, region, certification, overview, total_seasons, total_episodes, genres FROM works ORDER BY title").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map([], |r| {
+        let poster: Option<String> = r.get(3)?;
+        let backdrop: Option<String> = r.get(4)?;
+        Ok(WorkItem{
+            tmdb_id: r.get(0)?,
+            kind: r.get(1)?,
+            title: r.get(2)?,
+            poster: cached(&poster),
+            backdrop: cached(&backdrop),
+            rating: r.get(5)?,
+            air_date: r.get(6)?,
+            region: r.get(7)?,
+            certification: r.get(8)?,
+            overview: r.get(9)?,
+            total_seasons: r.get(10)?,
+            total_episodes: r.get(11)?,
+            genres: serde_json::from_str(&r.get::<_,String>(12)?).unwrap_or_default(),
+        })
+    }).map_err(|e|e.to_string())?;
+    rows.collect::<Result<Vec<_>,_>>().map_err(|e|e.to_string())
+}
+// 媒体库：未刮削的视频文件（file_id 不在 works.seasons 里）
+#[tauri::command]
+fn list_unscraped(app: tauri::AppHandle)->Result<Vec<UnscrapedItem>, String>{
+    let db = open_db(&app)?;
+    let mut scraped: HashSet<i64> = HashSet::new();
+    {
+        let mut stmt = db.prepare("SELECT seasons FROM works").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map([], |r| r.get::<_,String>(0)).map_err(|e|e.to_string())?;
+        for row in rows {
+            let v: Value = serde_json::from_str(&row.map_err(|e|e.to_string())?).unwrap_or_else(|_| json!([]));
+            for g in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                for e in g["episodes"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                    if let Some(fid) = e["file_id"].as_i64() { scraped.insert(fid); }
+                }
+            }
+        }
+    }
+    let mut stmt = db.prepare("SELECT id, rel_path FROM files WHERE type = 'video' ORDER BY rel_path").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (fid, rel) = row.map_err(|e|e.to_string())?;
+        if scraped.contains(&fid) { continue }
+        let file = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+        let name = file.rsplit_once('.').map(|(s,_)| s.to_string()).unwrap_or(file);
+        out.push(UnscrapedItem{ name, rel_path: rel });
+    }
+    Ok(out)
+}
+// 作品详情：作品字段 + 分集（seasons JSON 扁平化，补文件大小）+ 演职人员
+#[tauri::command]
+fn get_work(app: tauri::AppHandle, tmdb: i64, kind: String)->Result<WorkDetail, String>{
+    let db = open_db(&app)?;
+    let dir = img_cache_dir(&app);
+    let cached = |p: &Option<String>| -> Option<String> {
+        p.as_ref().map(|p| dir.join(p.rsplit('/').next().unwrap_or("")))
+            .filter(|f| f.exists() && f.is_file())
+            .map(|f| f.to_string_lossy().to_string())
+    };
+    let row: (String, Option<String>, Option<String>, Option<f64>, Option<String>, Option<String>,
+              Option<String>, Option<String>, Option<i64>, Option<i64>, String, String, String) = db.query_row(
+        "SELECT title, poster, backdrop, rating, air_date, region, certification, overview, total_seasons, total_episodes, genres, cast_json, seasons FROM works WHERE tmdb_id = ?1 AND kind = ?2",
+        params![tmdb, kind],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?,
+                r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?, r.get(10)?, r.get(11)?, r.get(12)?)),
+    ).map_err(|e|e.to_string())?;
+    let (title, poster, backdrop, rating, air_date, region, certification, overview,
+        total_seasons, total_episodes, genres, cast, seasons) = row;
+
+    // 文件大小表（算总量/分集大小）
+    let mut sizes: HashMap<i64, i64> = HashMap::new();
+    {
+        let mut stmt = db.prepare("SELECT id, size FROM files").map_err(|e|e.to_string())?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,i64>(1)?))).map_err(|e|e.to_string())?;
+        for row in rows { let (i, s) = row.map_err(|e|e.to_string())?; sizes.insert(i, s); }
+    }
+    // seasons JSON → 扁平分集列表
+    let v: Value = serde_json::from_str(&seasons).unwrap_or_else(|_| json!([]));
+    let mut episodes = Vec::new();
+    let mut total_size = 0i64;
+    for g in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+        let season = g["season"].as_i64().unwrap_or(0) as u32;
+        for e in g["episodes"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            let file_id = e["file_id"].as_i64().unwrap_or(0);
+            let size = sizes.get(&file_id).copied().unwrap_or(0);
+            total_size += size;
+            episodes.push(EpisodeItem{
+                file_id,
+                season,
+                episode: e["episode"].as_i64().unwrap_or(0) as u32,
+                title: e["title"].as_str().unwrap_or("").to_string(),
+                still: cached(&e["still"].as_str().map(|s| s.to_string())),
+                size,
+            });
+        }
+    }
+    episodes.sort_by_key(|e| (e.season, e.episode));
+    // 演职人员
+    let cv: Value = serde_json::from_str(&cast).unwrap_or_else(|_| json!([]));
+    let cast: Vec<CastItem> = cv.as_array().map(|a| a.iter().map(|c| CastItem{
+        name: c["name"].as_str().unwrap_or("").to_string(),
+        character: c["character"].as_str().unwrap_or("").to_string(),
+        photo: cached(&c["photo"].as_str().map(|s| s.to_string())),
+    }).collect()).unwrap_or_default();
+    Ok(WorkDetail{
+        tmdb_id: tmdb, kind, title,
+        poster: cached(&poster), backdrop: cached(&backdrop),
+        rating, air_date, region, certification, overview,
+        total_seasons, total_episodes,
+        genres: serde_json::from_str(&genres).unwrap_or_default(),
+        cast, total_size, episodes,
+    })
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting])
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

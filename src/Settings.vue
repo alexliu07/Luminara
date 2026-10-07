@@ -2,7 +2,9 @@
 import { ref, onMounted } from 'vue'
 import { invoke } from '@tauri-apps/api/core'
 import { showToast } from './toast.js'
+import { usePageScroller } from './scroll.js'
 
+const scroller = usePageScroller()
 const tmdbKey = ref('')
 const saving = ref(false)
 
@@ -29,7 +31,7 @@ async function onSaveTmdb() {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" ref="scroller">
     <h1 class="page-title">设置</h1>
     <ul class="list">
       <li class="item">
@@ -48,7 +50,9 @@ async function onSaveTmdb() {
 
 <style scoped>
 .page {
-  min-height: calc(100vh / var(--ui-scale));
+  height: calc(100vh / var(--ui-scale));
+  overflow-y: auto;
+  scrollbar-width: none;
   padding: 18px 14px 110px;
   background: var(--bg);
   color: var(--card-ink);
@@ -56,6 +60,7 @@ async function onSaveTmdb() {
     -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
 }
+.page::-webkit-scrollbar { display: none; }
 .page-title {
   margin: 0 0 14px;
   font-size: 20px;

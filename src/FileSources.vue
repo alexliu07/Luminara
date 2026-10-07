@@ -2,6 +2,9 @@
 import { ref, onMounted, nextTick } from 'vue'
 import {invoke} from "@tauri-apps/api/core";
 import { showToast, hideToast } from './toast.js'
+import { usePageScroller } from './scroll.js'
+
+const scroller = usePageScroller()
 // 数据
 const sources = ref([])
 const sourcemap = {0:'本地',1:'WebDAV'}
@@ -208,7 +211,7 @@ async function onTestWebdav() {
 </script>
 
 <template>
-  <div class="page">
+  <div class="page" ref="scroller">
     <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
       <symbol id="i-plus" viewBox="0 0 24 24">
         <path d="M12 5.5v13M5.5 12h13" />
@@ -330,7 +333,9 @@ async function onTestWebdav() {
   overflow: hidden;
 }
 .page {
-  min-height: calc(100vh / var(--ui-scale));
+  height: calc(100vh / var(--ui-scale));
+  overflow-y: auto;
+  scrollbar-width: none;
   padding: 18px 14px 110px;
   background: var(--bg);
   color: var(--card-ink);
@@ -338,6 +343,7 @@ async function onTestWebdav() {
     -apple-system, 'Segoe UI', sans-serif;
   -webkit-font-smoothing: antialiased;
 }
+.page::-webkit-scrollbar { display: none; }
 .page-title {
   margin: 0;
   font-size: 20px;

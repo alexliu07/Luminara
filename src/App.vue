@@ -1,31 +1,43 @@
 <script setup>
-import { ref, onMounted, onBeforeUnmount, nextTick } from 'vue'
-import MediaLibrary from './MediaLibrary.vue'
-import FileSources from './FileSources.vue'
-import Settings from './Settings.vue'
+import {ref, onMounted, onBeforeUnmount, nextTick, watch} from 'vue'
 import { toast, hideToast} from './toast.js'
+import { useRoute, useRouter } from 'vue-router'
+import { activeScrollEl } from './scroll.js'
 
 // tab id → 页面组件
-const pages = {
-  library: MediaLibrary,
-  sources: FileSources,
-  settings: Settings,
-}
-
+const route = useRoute()
+const router = useRouter()
 const tabs = [
-  { id: 'library', label: '媒体库', icon: 'library' },
-  { id: 'sources', label: '文件源', icon: 'folder' },
-  { id: 'settings', label: '设置', icon: 'gear' },
+  { id: '/', label: '媒体库', icon: 'library' },
+  { id: '/sources', label: '文件源', icon: 'folder' },
+  { id: '/settings', label: '设置', icon: 'gear' },
 ]
-
-const current = ref('library')
+// 过渡方向：前进 slide、后退 slide-back、tab 间瞬切
+const transitionName = ref('none')
+let histPos = window.history.state?.position ?? 0
+router.afterEach((to, from) => {
+  const pos = window.history.state?.position ?? histPos
+  const back = pos < histPos
+  histPos = pos
+  transitionName.value = (!from.matched.length || (!to.meta.overlay && !from.meta.overlay))
+      ? 'none'                                  // 初次进入 / tab 之间
+      : (back ? 'slide-back' : 'slide')         // 只要有一边是覆盖页就播动画
+})
+function switchTab(path) {
+  router.push(path)
+}
+// 路由变了（切 tab / 返回）重新定位胶囊
+watch(() => route.path, () => nextTick(updateIndicator))
 const trackEl = ref(null)
 const thumbEl = ref(null)
 const tabbarEl = ref(null)
 const indicatorEl = ref(null)
 
+function scrollRoot() {
+  return activeScrollEl.value || document.documentElement
+}
 function updateScrollbar() {
-  const doc = document.documentElement
+  const doc = scrollRoot()
   const track = trackEl.value
   const thumb = thumbEl.value
   if (!track || !thumb) return
@@ -43,11 +55,11 @@ function updateScrollbar() {
 }
 
 function uiScale() {
-  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ui-scale')) || 1
+  return parseFloat(getComputedStyle(scrollRoot()).getPropertyValue('--ui-scale')) || 1
 }
 
 function onThumbDown(e) {
-  const doc = document.documentElement
+  const doc = scrollRoot()
   const trackH = trackEl.value.clientHeight
   const thumbH = thumbEl.value.clientHeight
   const scrollable = doc.scrollHeight - doc.clientHeight
@@ -70,30 +82,23 @@ function onThumbDown(e) {
 }
 
 onMounted(() => {
-  window.addEventListener('scroll', updateScrollbar, { passive: true })
+  window.addEventListener('scroll', updateScrollbar, { passive: true, capture: true })
   window.addEventListener('resize', updateScrollbar)
   window.addEventListener('resize', updateIndicator)
   updateScrollbar()
   nextTick(updateIndicator)
 })
 onBeforeUnmount(() => {
-  window.removeEventListener('scroll', updateScrollbar)
+  window.addEventListener('scroll', updateScrollbar, { passive: true, capture: true })
   window.removeEventListener('resize', updateScrollbar)
 })
-
-function switchTab(id) {
-  current.value = id
-  window.scrollTo(0, 0) // 切换页面后回到顶部
-  nextTick(updateScrollbar);
-  nextTick(updateIndicator);
-}
 
 function updateIndicator() {
   const bar = tabbarEl.value
   const ind = indicatorEl.value
   if (!bar || !ind) return
   const els = bar.querySelectorAll('.tab')
-  const i = tabs.findIndex((t) => t.id === current.value)
+  const i = tabs.findIndex((t) => t.id === route.path)
   const el = els[i]
   if (!el) return
   const padX = 12 // 胶囊比 tab 窄一点，做出内边距
@@ -101,7 +106,6 @@ function updateIndicator() {
   ind.style.width = el.offsetWidth - padX * 2 + 'px'
   ind.style.transform = `translate(${el.offsetLeft + padX}px, ${el.offsetTop + padY}px)`
 }
-
 </script>
 
 <template>
@@ -129,13 +133,17 @@ function updateIndicator() {
     <div class="scrollbar" ref="trackEl">
       <div class="scrollbar-thumb" ref="thumbEl" @pointerdown.prevent="onThumbDown"></div>
     </div>
-    <!-- 页面容器：随底部栏切换，KeepAlive 保留各页状态 -->
-    <KeepAlive>
-      <component :is="pages[current]" />
-    </KeepAlive>
+    <!-- 页面容器：路由切换 + KeepAlive 保留状态 -->
+    <router-view v-slot="{ Component, route: r }">
+      <Transition :name="transitionName">
+        <KeepAlive :include="['MediaLibrary', 'FileSources', 'Settings', 'ViewAll']">
+          <component :is="Component" :key="r.fullPath" />
+        </KeepAlive>
+      </Transition>
+    </router-view>
 
     <!-- 底部主导航 -->
-    <nav class="tabbar" ref="tabbarEl">
+    <nav class="tabbar" ref="tabbarEl" v-if="!route.meta.overlay">
       <!-- 图标 sprite -->
       <svg class="sprite" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
         <symbol id="tb-library" viewBox="0 0 24 24">
@@ -163,7 +171,7 @@ function updateIndicator() {
         class="tab"
         v-for="t in tabs"
         :key="t.id"
-        :class="{ on: t.id === current }"
+        :class="{ on: t.id === route.path }"
         @click="switchTab(t.id)"
       >
         <svg class="ic"><use :href="'#tb-' + t.icon" /></svg>
@@ -176,6 +184,7 @@ function updateIndicator() {
 <style scoped>
 .app {
   min-height: calc(100vh / var(--ui-scale));
+  position: relative;
 }
 
 .sprite {
@@ -225,9 +234,9 @@ function updateIndicator() {
 
 .tab-indicator {
   position: absolute;
-  top: 0;
+  top: -3px;
   left: 0;
-  height: 42px; /* 或让 JS 一并设置 height */
+  height: 48px; /* 或让 JS 一并设置 height */
   border-radius: 24px;
   background: var(--tab-bg);          /* 与玻璃胶囊同款 */
   box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.5);
@@ -317,5 +326,32 @@ function updateIndicator() {
 .toast-enter-from,
 .toast-leave-to {
   opacity: 0;
+}
+/* ── 页面切换动画 ───────────────────────────────────── */
+.slide-enter-active, .slide-leave-active,
+.slide-back-enter-active, .slide-back-leave-active {
+  transition: transform 0.28s ease, opacity 0.28s ease;
+}
+.slide-enter-from   { transform: translateX(30%);opacity: 0; }              /* 前进：新页从右滑入 */
+.slide-leave-to     { transform: translateX(-25%); opacity: 0; }  /* 前进：旧页左移淡出 */
+.slide-back-enter-from { transform: translateX(-25%); opacity: 0; } /* 后退：下层页从左回位 */
+.slide-back-leave-to   { transform: translateX(100%); }             /* 后退：覆盖页滑出右侧 */
+.slide-leave-active, .slide-back-leave-active {
+  position: absolute;
+  top: 0; left: 0; right: 0;
+  height: calc(100vh / var(--ui-scale));
+  z-index: 1;
+}
+.slide-enter-active, .slide-back-enter-active {
+  position: relative;
+  z-index: 2;
+}
+</style>
+<style>
+/* 过渡期间暂停 backdrop-filter 重采样，滑动完自动恢复（掉帧主因） */
+.slide-enter-active *, .slide-leave-active *,
+.slide-back-enter-active *, .slide-back-leave-active * {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
 }
 </style>
