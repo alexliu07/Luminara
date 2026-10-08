@@ -130,7 +130,7 @@ function updateIndicator() {
       </div>
     </Transition>
     <!-- 自定义滚动条 -->
-    <div class="scrollbar" ref="trackEl">
+    <div class="scrollbar" ref="trackEl" v-show="!route.meta.hideScrollbar">
       <div class="scrollbar-thumb" ref="thumbEl" @pointerdown.prevent="onThumbDown"></div>
     </div>
     <!-- 页面容器：路由切换 + KeepAlive 保留状态 -->

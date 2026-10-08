@@ -76,13 +76,13 @@ const continueRow = {
   items: [
     {
       title: '不时用俄语小声说真心话的邻桌艾莉…',
-      sub: '第1季 第12集',
+      sub: '第1季 第12话',
       colors: ['#6d7fa8', '#c7d2e8'],
       progress: 0.45,
     },
     {
       title: '想吃掉我的非人少女',
-      sub: '第1季 第5集',
+      sub: '第1季 第5话',
       colors: ['#8a6f9e', '#e2c4d8'],
       progress: 0.2,
     },

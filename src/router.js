@@ -4,6 +4,7 @@ import FileSources from './FileSources.vue'
 import Settings from './Settings.vue'
 import ViewAll from './ViewAll.vue'
 import WorkDetail from './WorkDetail.vue'
+import Player from './Player.vue'
 
 export const router = createRouter({
     history: createWebHashHistory(),   // hash 模式，刷新/深链不 404
@@ -13,6 +14,7 @@ export const router = createRouter({
         { path: '/settings', component: Settings },
         { path: '/all/:category', component: ViewAll, meta: { overlay: true } },
         { path: '/work/:kind/:tmdb', component: WorkDetail, meta: { overlay: true } },
+        { path: '/play/:kind/:tmdb/:fileId', component: Player, meta: { overlay: true, hideScrollbar: true } },
         { path: '/:pathMatch(.*)*', redirect: '/' },
     ],
 })

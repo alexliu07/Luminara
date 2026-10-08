@@ -1,4 +1,5 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
+mod proxy;
 use serde::{Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -114,6 +115,23 @@ struct WorkDetail{
     cast: Vec<CastItem>,
     total_size: i64,
     episodes: Vec<EpisodeItem>,
+}
+// 播放信息：字幕条目
+#[derive(Serialize)]
+struct SubtitleItem{
+    file_id: i64,
+    label: String,
+    format: String,   // srt / vtt / ass / ssa
+}
+// 播放信息
+#[derive(Serialize)]
+struct PlaybackInfo{
+    file_id: i64,
+    name: String,        // 视频文件名（含扩展名）
+    src_kind: String,    // local / webdav
+    src: String,         // local: 绝对路径（前端 convertFileSrc）；webdav: 本地代理地址
+    size: i64,
+    subtitles: Vec<SubtitleItem>,
 }
 // ==================== TMDB 刮削 ====================
 const TMDB_API: &str = "https://api.themoviedb.org/3";
@@ -306,6 +324,21 @@ fn resolve_href(base: &str, href: &str)->String{
     let rest = &base[i..];
     let origin_len = rest.find('/').map(|j| i + j).unwrap_or(base.len());
     format!("{}{}", &base[..origin_len], href)
+}
+// rel_path 拼进 WebDAV 根 URL，逐段百分号编码（索引里的 rel 是解码过的）
+fn webdav_url(root: &str, rel: &str)->String{
+    let enc = |s: &str| -> String {
+        let mut out = String::with_capacity(s.len());
+        for b in s.as_bytes() {
+            match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => out.push(*b as char),
+                _ => out.push_str(&format!("%{:02X}", b)),
+            }
+        }
+        out
+    };
+    let path = rel.split('/').map(enc).collect::<Vec<_>>().join("/");
+    format!("{}/{}", root.trim_end_matches('/'), path)
 }
 // 解析PROPFIND的207 Multi-Status，返回 (href, 是否目录, size, mtime)
 fn parse_multistatus(xml: &str)->Result<Vec<(String, bool, i64, i64)>, String>{
@@ -1154,12 +1187,153 @@ fn get_work(app: tauri::AppHandle, tmdb: i64, kind: String)->Result<WorkDetail, 
     })
 }
 
+// ==================== 播放 ====================
+// 字幕语言后缀 → 显示名（chs&eng 这类多标记也认）；认不出用文件名
+fn subtitle_label(sfx: &str, file: &str)->String{
+    let mut parts: Vec<&str> = Vec::new();
+    for t in sfx.trim_start_matches('.').split(['.', '&', '+', '_', ' ']).filter(|t| !t.is_empty()) {
+        let s = match t.to_lowercase().as_str() {
+            "zh" | "chs" | "sc" | "gb" | "zh-cn" | "zh-hans" | "简" | "简体" | "简中" | "中字" => "简体中文",
+            "cht" | "tc" | "big5" | "zh-tw" | "zh-hant" | "繁" | "繁体" | "繁中" => "繁體中文",
+            "en" | "eng" | "英文" => "English",
+            "ja" | "jp" | "jpn" | "日" | "日文" => "日本語",
+            "ko" | "kr" | "kor" | "韩" | "韩文" => "한국어",
+            "fr" | "fre" | "fra" | "法" | "法文" => "Français",
+            "de" | "ger" | "deu" | "德" | "德文" => "Deutsch",
+            "ru" | "rus" | "俄" | "俄文" => "Русский",
+            "default" | "forced" | "sdh" | "cc" | "comment" => continue,
+            _ => t,
+        };
+        if !parts.contains(&s) { parts.push(s); }
+    }
+    if parts.is_empty() { file.to_string() } else { parts.join("&") }
+}
+// TODO: mkv 内嵌字幕解析、ass 特效字幕解析（内嵌轨提取后并入本配对列表）
+// 同目录同名词幕：ep01.mkv 配 ep01.srt / ep01.zh.ass / ep01.chs&eng.srt；sub/idx 位图不收
+fn find_subtitles(db: &Connection, lib_id: i64, video_rel: &str)->Result<Vec<SubtitleItem>, String>{
+    let (dir, file) = video_rel.rsplit_once('/').unwrap_or(("", video_rel));
+    let stem = file.rsplit_once('.').map(|(s,_)| s).unwrap_or(file);
+    let mut stmt = db.prepare("SELECT id, rel_path FROM files WHERE lib_id = ?1 AND type = 'subtitle' ORDER BY rel_path").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map(params![lib_id], |r| Ok((r.get::<_,i64>(0)?, r.get::<_,String>(1)?))).map_err(|e|e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (fid, rel) = row.map_err(|e|e.to_string())?;
+        let (sdir, sfile) = rel.rsplit_once('/').unwrap_or(("", &rel));
+        if sdir != dir { continue }
+        let Some((sname, sext)) = sfile.rsplit_once('.') else { continue };
+        let ext = sext.to_lowercase();
+        if !["srt","vtt","ass","ssa"].contains(&ext.as_str()) { continue }
+        let Some(sfx) = sname.strip_prefix(stem) else { continue };
+        if !sfx.is_empty() && !sfx.starts_with('.') { continue }
+        out.push(SubtitleItem{ file_id: fid, label: subtitle_label(sfx, sfile), format: ext });
+    }
+    Ok(out)
+}
+// 字幕文本解码：UTF-8 优先（去 BOM），失败按 GBK 兼容（老 SRT 常见）
+fn decode_text(bytes: &[u8])->String{
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.trim_start_matches('\u{feff}').to_string(),
+        Err(_) => encoding_rs::GBK.decode(bytes).0.into_owned(),
+    }
+}
+// 系统中文字体文件（给 ASS 渲染用）
+#[derive(Serialize)]
+struct FontFile{
+    path: String,
+    family: String,   // 字体族名（libass 默认字体）
+}
+// 系统中文字体候选：只返回路径，字节由前端经 asset protocol 读取
+#[tauri::command]
+fn get_cjk_fonts()->Result<Vec<FontFile>, String>{
+    let windir = std::env::var("windir").unwrap_or_else(|_| "C:\\Windows".into());
+    let candidates: Vec<(String, &str)> = vec![
+        // Windows：雅黑（简）→ 黑体（兜底单文件 TTF）→ 正黑（繁）→ 宋体
+        (format!("{}\\Fonts\\msyh.ttc", windir), "Microsoft YaHei"),
+        (format!("{}\\Fonts\\simhei.ttf", windir), "SimHei"),
+        (format!("{}\\Fonts\\msjh.ttc", windir), "Microsoft JhengHei"),
+        (format!("{}\\Fonts\\simsun.ttc", windir), "SimSun"),
+        // macOS
+        ("/System/Library/Fonts/PingFang.ttc".into(), "PingFang SC"),
+        ("/System/Library/Fonts/STHeiti Light.ttc".into(), "Heiti SC"),
+        // Linux
+        ("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc".into(), "Noto Sans CJK SC"),
+        ("/usr/share/fonts/truetype/wqy/wqy-microhei.ttc".into(), "WenQuanYi Micro Hei"),
+    ];
+    let out: Vec<FontFile> = candidates.into_iter()
+        .filter(|(p, _)| std::path::Path::new(p).is_file())
+        .take(2)   // 一个主力 + 一个兜底足够（TTF 兜底防 .ttc 解析失败）
+        .map(|(path, family)| FontFile{ path, family: family.to_string() })
+        .collect();
+    if out.is_empty() { Err("未找到系统中文字体".into()) } else { Ok(out) }
+}
+// 播放信息：定位播放源 + 同名词幕列表
+#[tauri::command]
+fn get_playback_info(app: tauri::AppHandle, file_id: i64)->Result<PlaybackInfo, String>{
+    let db = open_db(&app)?;
+    let row: Option<(String, i64, i64, i32, String)> = db.query_row(
+        "SELECT f.rel_path, f.lib_id, f.size, s.source, s.data_a FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
+        params![file_id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    ).optional().map_err(|e|e.to_string())?;
+    let Some((rel, lib_id, size, source, data_a)) = row else { return Err("文件不存在或已被删除".into()) };
+    let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
+    let subtitles = find_subtitles(&db, lib_id, &rel)?;
+    let (src_kind, src) = match source {
+        0 => ("local", std::path::Path::new(&data_a).join(&rel).to_string_lossy().to_string()),
+        1 => ("webdav", format!("http://127.0.0.1:{}/dav/{}", proxy::port(), file_id)),
+        _ => return Err("不支持的文件源类型".into()),
+    };
+    Ok(PlaybackInfo{ file_id, name, src_kind: src_kind.to_string(), src, size, subtitles })
+}
+// 读取字幕原文：本地直接读文件，WebDAV 走 GET 整读
+#[tauri::command]
+async fn get_subtitle_text(app: tauri::AppHandle, file_id: i64)->Result<String, String>{
+    let row: Option<(String, i32, String, Option<String>, Option<String>)> = {
+        let db = open_db(&app)?;
+        db.query_row(
+            "SELECT f.rel_path, s.source, s.data_a, s.data_e, s.data_f FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
+            params![file_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        ).optional().map_err(|e|e.to_string())?
+    };
+    let Some((rel, source, data_a, user, pass)) = row else { return Err("文件不存在或已被删除".into()) };
+    match source {
+        0 => {
+            let abs = std::path::Path::new(&data_a).join(&rel);
+            Ok(decode_text(&fs::read(&abs).map_err(|e|e.to_string())?))
+        }
+        1 => {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(20))
+                .build().map_err(|e|e.to_string())?;
+            let mut req = client.get(webdav_url(&data_a, &rel));
+            if !user.as_deref().unwrap_or("").is_empty() {
+                req = req.basic_auth(user.unwrap_or_default(), Some(pass.unwrap_or_default()));
+            }
+            let resp = req.send().await.map_err(|e|e.to_string())?;
+            if !resp.status().is_success() {
+                return Err(format!("字幕下载失败（HTTP {}）", resp.status().as_u16()));
+            }
+            Ok(decode_text(&resp.bytes().await.map_err(|e|e.to_string())?))
+        }
+        _ => Err("不支持的文件源类型".into()),
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work])
+        .setup(|app| {
+            // WebDAV 播放代理：失败不影响其他功能，在线播放会不可用
+            match proxy::start(app.handle().clone()) {
+                Ok(port) => println!("播放代理监听 127.0.0.1:{}", port),
+                Err(e) => println!("[播放代理] 启动失败：{}", e),
+            }
+            Ok(())
+        })
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work, get_playback_info, get_subtitle_text, get_cjk_fonts])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

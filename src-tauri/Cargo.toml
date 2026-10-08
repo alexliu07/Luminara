@@ -23,12 +23,14 @@ tauri-plugin-opener = "2"
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 rusqlite = {version = "0.40.2",features = ["bundled"] }
-reqwest = {version = "0.12",default-features = false,features = ["rustls-tls", "json"] }
+reqwest = {version = "0.12",default-features = false,features = ["rustls-tls", "json", "blocking"] }
 roxmltree = "0.21.1"
 httpdate = "1"
 serde_json = "1"
 regex = "1"
 tokio = {version = "1", features = ["time"] }
+tiny_http = "0.12"
+encoding_rs = "0.8"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

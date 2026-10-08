@@ -28,17 +28,29 @@ function onBack() {
   router.back()
 }
 
+// 进入播放页（单集/电影第一条目）
+function playEp(ep) {
+  if (justDragged) return
+  if (!ep?.file_id) return
+  router.push(`/play/${route.params.kind}/${route.params.tmdb}/${ep.file_id}`)
+}
+
 // 拖拽平移（与媒体库同款）
 function rowDrag(e) {
   const el = e.currentTarget
   const startX = e.clientX
   const startLeft = el.scrollLeft
+  let moved = false
   el.classList.add('dragging')
-  function onMove(ev) { el.scrollLeft = startLeft - (ev.clientX - startX) }
+  function onMove(ev) {
+    if (Math.abs(ev.clientX - startX) > 5) moved = true
+    el.scrollLeft = startLeft - (ev.clientX - startX)
+  }
   function onUp() {
     el.classList.remove('dragging')
     window.removeEventListener('mousemove', onMove)
     window.removeEventListener('mouseup', onUp)
+    if (moved) markDragged()
   }
   window.addEventListener('mousemove', onMove)
   window.addEventListener('mouseup', onUp)
@@ -70,12 +82,18 @@ const detailSub = computed(() => {
   const d = detail.value
   if (!d) return ''
   return d.kind === 'tv'
-      ? `共${d.total_episodes ?? '?'}集 (找到${d.episodes.length}集)`
+      ? `共${d.total_episodes ?? '?'}话 (找到${d.episodes.length}集)`
       : fmtSize(d.total_size)
 })
 
 const grad = (c) => `linear-gradient(155deg, ${c[0]} 0%, ${c[1]} 100%)`
 const emptyColors = ['#4a4a52', '#2e2e34']
+// 拖动结束后的瞬间忽略 click，防止“拖着滑行后松手在原卡上”误开播放页
+let justDragged = false
+function markDragged() {
+  justDragged = true
+  setTimeout(() => { justDragged = false }, 0)   // click 派发完再复位
+}
 </script>
 
 <template>
@@ -124,7 +142,7 @@ const emptyColors = ['#4a4a52', '#2e2e34']
           <p class="d-sub">{{ detailSub }}</p>
         </div>
         <div class="d-actions">
-          <button class="d-play" type="button"><!-- TODO: 播放 -->
+          <button class="d-play" type="button" @click="playEp(detail.episodes[0])">
             <svg class="ic"><use href="#i-play" /></svg><span>播放</span>
           </button>
           <div class="d-icons">
@@ -152,7 +170,7 @@ const emptyColors = ['#4a4a52', '#2e2e34']
         </div>
       </div>
       <div class="row d-eps" @mousedown.left="rowDrag">
-        <article class="e-card" v-for="ep in epShow" :key="ep.file_id">
+        <article class="e-card" v-for="ep in epShow" :key="ep.file_id" @click="playEp(ep)">
           <div class="e-art">
             <img v-if="ep.still" class="e-img" :src="convertFileSrc(ep.still)" draggable="false" />
             <span v-else class="e-num">{{ ep.episode }}</span>
@@ -330,6 +348,7 @@ const emptyColors = ['#4a4a52', '#2e2e34']
 .e-card {
   flex-shrink: 0;
   width: clamp(150px, 17vw, 190px);
+  cursor: pointer;
   transition: transform 0.18s ease;
 }
 .e-card:hover {
