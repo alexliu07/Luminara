@@ -5,7 +5,14 @@ use std::sync::OnceLock;
 
 static APP: OnceLock<tauri::AppHandle> = OnceLock::new();
 static PORT: OnceLock<u16> = OnceLock::new();
+static CLIENT: OnceLock<reqwest::blocking::Client> = OnceLock::new();   // ← 新增
 
+// 上游客户端全局复用：连接池 keep-alive，Range 小请求不再每次重新握手
+fn client() -> &'static reqwest::blocking::Client {
+    CLIENT.get_or_init(|| reqwest::blocking::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build().expect("构建代理客户端失败"))
+}
 // 代理端口（启动后可取，未启动为 0）
 pub fn port() -> u16 { PORT.get().copied().unwrap_or(0) }
 
@@ -17,7 +24,7 @@ pub fn start(app: tauri::AppHandle) -> Result<u16, String> {
     let _ = PORT.set(port);
     std::thread::spawn(move || {
         for req in server.incoming_requests() {
-            handle(req);
+            std::thread::spawn(move || handle(req));   // ← 每请求一线程，让前端并发真正并发
         }
     });
     Ok(port)
@@ -56,6 +63,20 @@ fn handle(req: tiny_http::Request) {
     let reply = |req: tiny_http::Request, code: u16, msg: &str| {
         let _ = req.respond(tiny_http::Response::from_string(msg).with_status_code(code));
     };
+    // CORS 预检：前端 fetch 带 Range 头需要它
+    if req.url().starts_with("/dav/") && req.method().eq(&tiny_http::Method::Options) {
+        let mut resp = tiny_http::Response::empty(204);
+        for (name, value) in [
+            ("Access-Control-Allow-Origin", "*"),
+            ("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"),
+            ("Access-Control-Allow-Headers", "Range, Accept, Accept-Encoding"),
+            ("Access-Control-Max-Age", "86400"),
+        ] {
+            if let Ok(h) = tiny_http::Header::from_bytes(name, value) { resp.add_header(h); }
+        }
+        let _ = req.respond(resp);
+        return;
+    }
     if req.url().starts_with("/dav/") && req.method().eq(&tiny_http::Method::Get) {
         let id = &req.url()["/dav/".len()..];
         let id = id.split('/').next().unwrap_or("");
@@ -65,11 +86,8 @@ fn handle(req: tiny_http::Request) {
                 Err(e) => return reply(req, 404, &e),
             };
             // 上游 GET：只透传 Range，其余请求头不带
-            let client = reqwest::blocking::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .build();
-            let Ok(client) = client else { return reply(req, 502, "代理内部错误") };
-            let mut rb = client.get(&url).header("Accept-Encoding", "identity");
+            // 上游 GET：只透传 Range，其余请求头不带
+            let mut rb = client().get(&url).header("Accept-Encoding", "identity");
             if !user.is_empty() { rb = rb.basic_auth(&user, Some(&pass)); }
             if let Some(range) = req.headers().iter().find(|h| h.field.equiv("Range")) {
                 rb = rb.header("Range", range.value.as_str().to_owned());
@@ -86,6 +104,8 @@ fn handle(req: tiny_http::Request) {
                 .map(|v| v.as_bytes().to_vec())
                 .unwrap_or_else(|| guess_type(&ext).as_bytes().to_vec());
             for (name, value) in [
+                ("Access-Control-Allow-Origin", b"*".to_vec()),
+                ("Access-Control-Expose-Headers", b"Content-Range, Accept-Ranges".to_vec()),   // ← 新增：不暴露 JS 就读不到 Content-Range
                 ("Content-Type", ctype),
                 ("Content-Range", resp.headers().get("Content-Range").map(|v| v.as_bytes().to_vec()).unwrap_or_default()),
                 ("Accept-Ranges", resp.headers().get("Accept-Ranges").map(|v| v.as_bytes().to_vec()).unwrap_or_default()),

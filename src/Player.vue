@@ -1,8 +1,8 @@
 <script setup>
-import { ref, computed, onMounted, onBeforeUnmount } from 'vue'
+import { ref, computed, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import { invoke, convertFileSrc } from '@tauri-apps/api/core'
 import { useRoute, useRouter } from 'vue-router'
-import { showToast } from './toast.js'
+import { showToast, hideToast } from './toast.js'
 import { srtToVtt, loadCjkFonts } from './subtitles.js'
 import '@videojs/html/video/player'
 import '@videojs/html/video/skin'
@@ -12,6 +12,9 @@ import workerUrl from 'jassub/dist/worker/worker.js?worker&url'
 import wasmUrl from 'jassub/dist/wasm/jassub-worker.wasm?url'
 import modernWasmUrl from 'jassub/dist/wasm/jassub-worker-modern.wasm?url'
 import {getWork} from './data.js'
+import { extractSubtitles } from '@cryguy/mkv-subtitle-extractor'
+import { openMkv, fetchWindow, assHeader } from './mkv.js'
+
 
 const route = useRoute()
 const router = useRouter()
@@ -24,7 +27,135 @@ let ass = null              // JASSUB 实例（ASS/SSA 用 libass 渲染）
 const uiHidden = ref(false)   // 顶栏自动隐藏（播放中无操作时）
 const title = ref('')
 let hideTimer = 0
+// ===== 内嵌字幕时间窗流式加载 =====
+const mkvMeta = new Map()      // file_id → Promise<meta>（SeekHead/Tracks/Cues/字体，一次解析常驻）
+const streamState = new Map()  // file_id:track → { loadedUntil, busy, pushed, cues, render }
+let timeHooked = false
 
+// 内嵌轨提取：@cryguy/mkv-subtitle-extractor 按 HTTP Range 只拉字幕块（不下载音视频）
+// 一次提取全部轨，Promise 去重防并发重复拉
+let extractPromise = null
+// 内嵌字体：原始字节存模块级 Map——放进 subs 会被 Vue 响应式包成 Proxy，postMessage 无法克隆
+const embeddedFonts = new Map()   // 轨号 → Uint8Array[]
+async function loadEmbedded() {
+  if (!extractPromise) {
+    extractPromise = (async () => {
+      const p = info.value
+      const url = p.src_kind === 'local' ? convertFileSrc(p.src) : p.src   // webdav 已是本地代理地址
+      const t0 = performance.now()
+      const tracks = await extractSubtitles(url, { concurrency: 8, allowFullDownload: true, verbose: true })
+      console.log(`[字幕] Range 提取完成，用时 ${(performance.now() - t0).toFixed(0)}ms，轨数 ${tracks.length}`)
+      for (const t of tracks) {
+        const s = subs.value.find(x => x.track === t.metadata.trackNumber)
+        if (!s) continue
+        const text = new TextDecoder().decode(t.output.subtitle)
+        s.text = text
+        embeddedFonts.set(t.metadata.trackNumber, (t.output.fonts || []).map(f => f.data))   // 只留字节，不进响应式对象
+        if (s.format !== 'ass' && s.format !== 'ssa') {
+          const vtt = s.format === 'srt' ? srtToVtt(text) : s.format === 'vtt' ? text : null
+          if (vtt) s.blobUrl = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }))
+        }
+      }
+    })().catch(e => { extractPromise = null; throw e })
+  }
+  return extractPromise
+}
+
+// 内嵌轨取文本：先走 Range 提取（快、带字体）；失败或轨号对不上回退后端提取
+async function fetchEmbeddedText(s) {
+  try {
+    await loadEmbedded()
+    if (s.text != null) return
+  } catch (e) {
+    console.error('Range 提取失败，回退后端提取', e)
+  }
+  s.text = await invoke('get_subtitle_text', { fileId: s.file_id, track: s.track })
+  if (s.format !== 'ass' && s.format !== 'ssa') {
+    const vtt = s.format === 'srt' ? srtToVtt(s.text) : s.format === 'vtt' ? s.text : null
+    if (vtt) s.blobUrl = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }))
+  }
+}
+function fmtVtt(ms) {
+  ms = Math.max(0, Math.round(ms))
+  const p = (n, w) => String(n).padStart(w, '0')
+  return `${p(Math.floor(ms / 3600000), 2)}:${p(Math.floor(ms / 60000 % 60), 2)}:${p(Math.floor(ms / 1000 % 60), 2)}.${p(ms % 1000, 3)}`
+}
+
+// 时间窗流式：失败抛错由调用方回退整文件提取
+async function startStream(s, v) {
+  const p = info.value
+  const url = p.src_kind === 'local' ? convertFileSrc(p.src) : p.src
+  if (!mkvMeta.has(s.file_id)) mkvMeta.set(s.file_id, openMkv(url))
+  const meta = await mkvMeta.get(s.file_id)
+  const t = meta.tracks.find(x => x.number === s.track)
+  if (!t) throw new Error('内嵌轨不存在')
+  const st = { loadedUntil: 0, busy: false, pushed: new Set(), cues: [], render: null }
+  streamState.set(s.file_id + ':' + s.track, st)   // 新渲染器换新状态，旧推送作废
+  if (s.format === 'ass' || s.format === 'ssa') {
+    let fonts, defaultFont
+    try { ({ fonts, defaultFont } = await loadCjkFonts()) } catch (e) {
+      console.error('中文字体加载失败', e)
+      ;({ fonts, defaultFont } = { fonts: [], defaultFont: '' })
+    }
+    if (activeSub.value !== subs.value.indexOf(s) || video.value !== v) return
+    const allFonts = [...meta.fonts.map(f => f.data), ...fonts]   // 内嵌字体优先
+    ass = new JASSUB({
+      video: v,
+      subContent: assHeader(t),        // 只装 Styles 头，事件走 processChunk 流式追加
+      workerUrl, wasmUrl, modernWasmUrl,
+      ...(allFonts.length ? { fonts: allFonts, ...(defaultFont ? { defaultFont } : {}) } : {}),
+    })
+    await ass.ready
+    st.render = blocks => { for (const b of blocks) ass.renderer.processChunk(b.text, b.timeMs, b.durMs) }
+  } else {
+    st.render = blocks => {
+      st.cues.push(...blocks)
+      st.cues.sort((a, b) => a.timeMs - b.timeMs)
+      const body = st.cues.map((c, i) =>
+          `${i + 1}\n${fmtVtt(c.timeMs)} --> ${fmtVtt(c.timeMs + c.durMs)}\n${c.text}\n`).join('\n')
+      if (s.blobUrl) URL.revokeObjectURL(s.blobUrl)
+      s.blobUrl = URL.createObjectURL(new Blob(['WEBVTT\n\n' + body], { type: 'text/vtt' }))
+      nextTick(() => {
+        const idx = subs.value.indexOf(s)
+        if (activeSub.value !== idx || video.value !== v) return
+        const el = v.querySelector(`track[data-sub="${idx}"]`)
+        if (el?.track) el.track.mode = 'showing'
+      })
+    }
+  }
+  if (!timeHooked) { v.addEventListener('timeupdate', onTimeUpdate); timeHooked = true }
+  await fillStream(s, st, Math.max(0, (v.currentTime || 0) * 1000 - 10000))
+}
+
+// 拉一个 150 秒窗并推给渲染器；已推过的块去重
+async function fillStream(s, st, fromMs) {
+  if (st.busy) return
+  st.busy = true
+  try {
+    const meta = await mkvMeta.get(s.file_id)
+    const blocks = await fetchWindow(meta, fromMs, fromMs + 150000, new Set([s.track]))
+    const fresh = blocks.filter(b => !st.pushed.has(b.timeMs + '�' + b.text))
+    for (const b of fresh) st.pushed.add(b.timeMs + '�' + b.text)
+    st.loadedUntil = Math.max(st.loadedUntil, fromMs + 150000)
+    if (fresh.length) st.render(fresh)
+  } finally {
+    st.busy = false
+  }
+}
+
+// 播放推进：前方余量不足 1 分钟就补下一窗（跳进度就以当前位置开窗）
+function onTimeUpdate() {
+  const i = activeSub.value
+  if (i < 0) return
+  const s = subs.value[i]
+  if (!s || s.track == null || s.windowed === false) return
+  const st = streamState.get(s.file_id + ':' + s.track)
+  if (!st || st.busy) return
+  const nowMs = (video.value?.currentTime || 0) * 1000
+  if (nowMs + 60000 <= st.loadedUntil) return
+  fillStream(s, st, Math.max(0, nowMs > st.loadedUntil ? nowMs - 10000 : st.loadedUntil))
+      .catch(e => console.warn('字幕窗口拉取失败', e))
+}
 // 鼠标一动就显示顶栏并重新计时；播放中静止 2.5 秒后隐藏
 function pokeUi() {
   uiHidden.value = false
@@ -60,8 +191,9 @@ onMounted(async () => {
     const p = await invoke('get_playback_info', { fileId: Number(route.params.fileId) })
     const list = []
     for (const s of p.subtitles) {
+      if (s.track != null) { list.push({ ...s, text: null, blobUrl: null }); continue }  // 内嵌轨选中时才提取
       try {
-        const text = await invoke('get_subtitle_text', { fileId: s.file_id })
+        const text = await invoke('get_subtitle_text', { fileId: s.file_id, track: s.track })
         const vtt = s.format === 'srt' ? srtToVtt(text) : s.format === 'vtt' ? text : null
         list.push({ ...s, text, blobUrl: vtt ? URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' })) : null })
       } catch (e) {
@@ -88,6 +220,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('mousemove', pokeUi)
   clearTimeout(hideTimer)
   for (const s of subs.value) if (s.blobUrl) URL.revokeObjectURL(s.blobUrl)
+  video.value?.removeEventListener('timeupdate', onTimeUpdate)
 })
 
 function selectSub(i) {
@@ -105,6 +238,30 @@ async function applySub() {
   const i = activeSub.value
   if (i < 0) return
   const s = subs.value[i]
+  // 内嵌轨：优先时间窗流式（边播边补）；容器不支持时回退整文件提取
+  if (s.track != null && s.windowed !== false) {
+    try {
+      await startStream(s, v)
+      return
+    } catch (e) {
+      console.warn('窗口流式加载不可用，回退整文件提取', e)
+      s.windowed = false
+    }
+  }
+  // 内嵌轨懒提取：首次选中才拉（一次提取全部轨，之后换轨零成本）
+  if (s.text == null) {
+    showToast('正在提取内嵌字幕…', 'spin')
+    try {
+      await fetchEmbeddedText(s)
+    } catch (e) {
+      console.error('字幕提取失败', s.label, e)
+      showToast('字幕提取失败：' + e, 'alert', 3000)
+      return
+    }
+    hideToast()
+    if (activeSub.value !== i || video.value !== v) return   // 等待期间又切走了
+    await nextTick()   // 让 <track> 元素先渲染出来
+  }
   if (s.format === 'ass' || s.format === 'ssa') {
     // 中文字形靠系统字体（WebView2 的 queryLocalFonts 不一定可用），失败也要能渲拉丁字
     let fonts, defaultFont
@@ -116,11 +273,12 @@ async function applySub() {
     }
     if (activeSub.value !== i || video.value !== v) return   // 等待期间又切走了
     try {
+      const allFonts = [...(embeddedFonts.get(s.track) || []), ...fonts]
       ass = new JASSUB({
         video: v,
         subContent: s.text,
         workerUrl, wasmUrl, modernWasmUrl,
-        ...(fonts.length ? { fonts, defaultFont } : {}),
+        ...(allFonts.length ? { fonts: allFonts, ...(defaultFont ? { defaultFont } : {}) } : {}),
       })
     } catch (e) {
       console.error('ASS 渲染初始化失败', e)
@@ -164,7 +322,7 @@ function onBack() {
         <Transition name="menu">
           <div class="p-menu" v-if="menuOpen">
             <button class="p-menu-item" type="button" :class="{ on: activeSub === -1 }" @click="selectSub(-1)">关闭</button>
-            <button class="p-menu-item" type="button" v-for="(s, i) in subs" :key="s.file_id"
+            <button class="p-menu-item" type="button" v-for="(s, i) in subs" :key="s.file_id + ':' + s.track"
                     :class="{ on: activeSub === i }" @click="selectSub(i)">{{ s.label }}</button>
           </div>
         </Transition>

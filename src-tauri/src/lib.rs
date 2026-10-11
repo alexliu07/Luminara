@@ -1,5 +1,6 @@
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 mod proxy;
+mod mkv;
 use serde::{Serialize};
 use serde_json::{json, Value};
 use std::fs;
@@ -120,6 +121,7 @@ struct WorkDetail{
 #[derive(Serialize)]
 struct SubtitleItem{
     file_id: i64,
+    track: Option<u32>,   // Some = mkv 内嵌轨号；None = 外挂字幕文件
     label: String,
     format: String,   // srt / vtt / ass / ssa
 }
@@ -1195,6 +1197,7 @@ fn subtitle_label(sfx: &str, file: &str)->String{
         let s = match t.to_lowercase().as_str() {
             "zh" | "chs" | "sc" | "gb" | "zh-cn" | "zh-hans" | "简" | "简体" | "简中" | "中字" => "简体中文",
             "cht" | "tc" | "big5" | "zh-tw" | "zh-hant" | "繁" | "繁体" | "繁中" => "繁體中文",
+            "chi" | "zho" => "中文",
             "en" | "eng" | "英文" => "English",
             "ja" | "jp" | "jpn" | "日" | "日文" => "日本語",
             "ko" | "kr" | "kor" | "韩" | "韩文" => "한국어",
@@ -1208,7 +1211,13 @@ fn subtitle_label(sfx: &str, file: &str)->String{
     }
     if parts.is_empty() { file.to_string() } else { parts.join("&") }
 }
-// TODO: mkv 内嵌字幕解析、ass 特效字幕解析（内嵌轨提取后并入本配对列表）
+// 内嵌轨标签：语言码（ISO 639-2）+ 轨名
+fn mkv_subtitle_label(lang: &str, name: &str) -> String {
+    let mut sfx = String::new();
+    if !lang.is_empty() && lang != "und" { sfx.push('.'); sfx.push_str(lang); }
+    if !name.is_empty() { sfx.push('.'); sfx.push_str(&name.replace([' ', '/'], ".")); }
+    subtitle_label(&sfx, if name.is_empty() { "内嵌字幕" } else { name })
+}
 // 同目录同名词幕：ep01.mkv 配 ep01.srt / ep01.zh.ass / ep01.chs&eng.srt；sub/idx 位图不收
 fn find_subtitles(db: &Connection, lib_id: i64, video_rel: &str)->Result<Vec<SubtitleItem>, String>{
     let (dir, file) = video_rel.rsplit_once('/').unwrap_or(("", video_rel));
@@ -1225,7 +1234,7 @@ fn find_subtitles(db: &Connection, lib_id: i64, video_rel: &str)->Result<Vec<Sub
         if !["srt","vtt","ass","ssa"].contains(&ext.as_str()) { continue }
         let Some(sfx) = sname.strip_prefix(stem) else { continue };
         if !sfx.is_empty() && !sfx.starts_with('.') { continue }
-        out.push(SubtitleItem{ file_id: fid, label: subtitle_label(sfx, sfile), format: ext });
+        out.push(SubtitleItem{ file_id: fid, track: None, label: subtitle_label(sfx, sfile), format: ext });
     }
     Ok(out)
 }
@@ -1235,6 +1244,19 @@ fn decode_text(bytes: &[u8])->String{
         Ok(s) => s.trim_start_matches('\u{feff}').to_string(),
         Err(_) => encoding_rs::GBK.decode(bytes).0.into_owned(),
     }
+}
+// 内嵌字幕文本缓存：{file_id}_{size}.json → {轨号: 文本}，提取过就不再通读容器
+fn sub_cache_path(app: &tauri::AppHandle, file_id: i64, size: i64) -> std::path::PathBuf {
+    app.path().app_data_dir().expect("配置目录不可用").join("sub_cache").join(format!("{}_{}.json", file_id, size))
+}
+fn cache_get(app: &tauri::AppHandle, file_id: i64, size: i64, track: u32) -> Option<String> {
+    let raw = fs::read_to_string(sub_cache_path(app, file_id, size)).ok()?;
+    serde_json::from_str::<HashMap<u32, String>>(&raw).ok()?.get(&track).cloned()
+}
+fn cache_put(app: &tauri::AppHandle, file_id: i64, size: i64, texts: &HashMap<u32, String>) {
+    let p = sub_cache_path(app, file_id, size);
+    if let Some(d) = p.parent() { let _ = fs::create_dir_all(d); }
+    if let Ok(s) = serde_json::to_string(texts) { let _ = fs::write(p, s); }
 }
 // 系统中文字体文件（给 ASS 渲染用）
 #[derive(Serialize)]
@@ -1266,18 +1288,50 @@ fn get_cjk_fonts()->Result<Vec<FontFile>, String>{
         .collect();
     if out.is_empty() { Err("未找到系统中文字体".into()) } else { Ok(out) }
 }
-// 播放信息：定位播放源 + 同名词幕列表
+// 播放信息：定位播放源 + 同名词幕列表（外挂 + mkv 内嵌）
 #[tauri::command]
 fn get_playback_info(app: tauri::AppHandle, file_id: i64)->Result<PlaybackInfo, String>{
     let db = open_db(&app)?;
-    let row: Option<(String, i64, i64, i32, String)> = db.query_row(
-        "SELECT f.rel_path, f.lib_id, f.size, s.source, s.data_a FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
+    let row: Option<(String, i64, i64, i32, String, Option<String>, Option<String>)> = db.query_row(
+        "SELECT f.rel_path, f.lib_id, f.size, s.source, s.data_a, s.data_e, s.data_f FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
         params![file_id],
-        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
     ).optional().map_err(|e|e.to_string())?;
-    let Some((rel, lib_id, size, source, data_a)) = row else { return Err("文件不存在或已被删除".into()) };
+    let Some((rel, lib_id, size, source, data_a, user, pass)) = row else { return Err("文件不存在或已被删除".into()) };
     let name = rel.rsplit('/').next().unwrap_or(&rel).to_string();
-    let subtitles = find_subtitles(&db, lib_id, &rel)?;
+    let mut subtitles = find_subtitles(&db, lib_id, &rel)?;
+    // mkv 内嵌字幕轨：只读到 Tracks 就停，不扫全文件
+    let ext = rel.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+    if matches!(ext.as_str(), "mkv" | "mka" | "webm") {
+        let res = match source {
+            0 => mkv::parse_local(&std::path::Path::new(&data_a).join(&rel).to_string_lossy(), false),
+            1 => {
+                let client = reqwest::blocking::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .build().map_err(|e|e.to_string())?;
+                let mut req = client.get(webdav_url(&data_a, &rel)).header("Range", "bytes=0-1048575");
+                if !user.as_deref().unwrap_or("").is_empty() {
+                    req = req.basic_auth(user.unwrap_or_default(), Some(pass.unwrap_or_default()));
+                }
+                let resp = req.send().map_err(|e|e.to_string())?;
+                // 206 截断或 200 全流都行：读到 Tracks 即停，然后 drop 响应
+                if !resp.status().is_success() { Err(format!("列轨失败（HTTP {}）", resp.status().as_u16())) }
+                else { Ok(mkv::parse_stream(resp, false)) }
+            }
+            _ => Err("不支持的文件源类型".into()),
+        };
+        match res {
+            Ok(p) => for t in p.tracks.into_iter().filter(|t| t.is_text()) {
+                subtitles.push(SubtitleItem{
+                    file_id,
+                    track: Some(t.number),
+                    label: mkv_subtitle_label(&t.lang, &t.name),
+                    format: t.format().to_string(),
+                });
+            },
+            Err(e) => println!("内嵌字幕列轨失败 {}: {}", rel, e),   // 失败不拦播放
+        }
+    }
     let (src_kind, src) = match source {
         0 => ("local", std::path::Path::new(&data_a).join(&rel).to_string_lossy().to_string()),
         1 => ("webdav", format!("http://127.0.0.1:{}/dav/{}", proxy::port(), file_id)),
@@ -1287,16 +1341,47 @@ fn get_playback_info(app: tauri::AppHandle, file_id: i64)->Result<PlaybackInfo, 
 }
 // 读取字幕原文：本地直接读文件，WebDAV 走 GET 整读
 #[tauri::command]
-async fn get_subtitle_text(app: tauri::AppHandle, file_id: i64)->Result<String, String>{
-    let row: Option<(String, i32, String, Option<String>, Option<String>)> = {
+async fn get_subtitle_text(app: tauri::AppHandle, file_id: i64, track: Option<u32>)->Result<String, String>{
+    let row: Option<(String, i64, i32, String, Option<String>, Option<String>)> = {
         let db = open_db(&app)?;
         db.query_row(
-            "SELECT f.rel_path, s.source, s.data_a, s.data_e, s.data_f FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
+            "SELECT f.rel_path, f.size, s.source, s.data_a, s.data_e, s.data_f FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
             params![file_id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
         ).optional().map_err(|e|e.to_string())?
     };
-    let Some((rel, source, data_a, user, pass)) = row else { return Err("文件不存在或已被删除".into()) };
+    let Some((rel, size, source, data_a, user, pass)) = row else { return Err("文件不存在或已被删除".into()) };
+    // 内嵌轨：提取（WebDAV 要通读容器，放 blocking 线程里跑）
+    if let Some(n) = track {
+        if let Some(t) = cache_get(&app, file_id, size, n) { return Ok(t) }
+        let parsed: Result<mkv::Parse, String> = match source {
+            0 => {
+                let abs = std::path::Path::new(&data_a).join(&rel);
+                tokio::task::spawn_blocking(move || mkv::parse_local(&abs.to_string_lossy(), true))
+                    .await.map_err(|e| e.to_string())?
+            }
+            1 => {
+                let (url, user, pass) = (webdav_url(&data_a, &rel), user.unwrap_or_default(), pass.unwrap_or_default());
+                tokio::task::spawn_blocking(move || {
+                    let client = reqwest::blocking::Client::builder()
+                        .connect_timeout(std::time::Duration::from_secs(10))
+                        .timeout(std::time::Duration::from_secs(600))
+                        .build().map_err(|e| e.to_string())?;
+                    let mut req = client.get(url).header("Accept-Encoding", "identity");
+                    if !user.is_empty() { req = req.basic_auth(user, Some(pass)); }
+                    let resp = req.send().map_err(|e| e.to_string())?;
+                    if !resp.status().is_success() {
+                        return Err(format!("下载失败（HTTP {}）", resp.status().as_u16()));
+                    }
+                    Ok(mkv::parse_stream(resp, true))
+                }).await.map_err(|e| e.to_string())?
+            }
+            _ => Err("不支持的文件源类型".into()),
+        };
+        let texts = parsed?.build_texts();   // 一次提取存下全部文本轨
+        cache_put(&app, file_id, size, &texts);
+        return texts.get(&n).cloned().ok_or_else(|| "内嵌轨不存在或不是文本字幕".to_string());
+    }
     match source {
         0 => {
             let abs = std::path::Path::new(&data_a).join(&rel);
@@ -1319,6 +1404,7 @@ async fn get_subtitle_text(app: tauri::AppHandle, file_id: i64)->Result<String, 
         _ => Err("不支持的文件源类型".into()),
     }
 }
+
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
