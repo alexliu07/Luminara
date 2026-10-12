@@ -14,6 +14,8 @@ import modernWasmUrl from 'jassub/dist/wasm/jassub-worker-modern.wasm?url'
 import {getWork} from './data.js'
 import { extractSubtitles } from '@cryguy/mkv-subtitle-extractor'
 import { openMkv, fetchWindow, assHeader } from './mkv.js'
+import { PgsRenderer } from 'libpgs'
+import pgsWorkerUrl from 'libpgs/dist/libpgs.worker.js?url'   // libpgs 是 classic worker，只能 ?url 原样引用（?worker&url 是 module worker）
 
 
 const route = useRoute()
@@ -24,6 +26,8 @@ const subs = ref([])        // [{file_id, label, format, text, blobUrl}]，blobU
 const activeSub = ref(-1)   // -1 = 关闭
 const menuOpen = ref(false)
 let ass = null              // JASSUB 实例（ASS/SSA 用 libass 渲染）
+let pgs = null              // PgsRenderer 实例（PGS 位图字幕）
+const pgsData = new Map()   // file_id:track → Uint8Array（不进响应式，同 embeddedFonts 的原因）
 const uiHidden = ref(false)   // 顶栏自动隐藏（播放中无操作时）
 const title = ref('')
 let hideTimer = 0
@@ -37,6 +41,14 @@ let timeHooked = false
 let extractPromise = null
 // 内嵌字体：原始字节存模块级 Map——放进 subs 会被 Vue 响应式包成 Proxy，postMessage 无法克隆
 const embeddedFonts = new Map()   // 轨号 → Uint8Array[]
+// 文本落进 s.text；srt/vtt 顺手建 <track> 用的 blob
+function setText(s, text) {
+  s.text = text
+  if (s.format !== 'ass' && s.format !== 'ssa') {
+    const vtt = s.format === 'srt' ? srtToVtt(text) : s.format === 'vtt' ? text : null
+    if (vtt) s.blobUrl = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }))
+  }
+}
 async function loadEmbedded() {
   if (!extractPromise) {
     extractPromise = (async () => {
@@ -45,35 +57,34 @@ async function loadEmbedded() {
       const t0 = performance.now()
       const tracks = await extractSubtitles(url, { concurrency: 8, allowFullDownload: true, verbose: true })
       console.log(`[字幕] Range 提取完成，用时 ${(performance.now() - t0).toFixed(0)}ms，轨数 ${tracks.length}`)
+      const texts = {}
       for (const t of tracks) {
         const s = subs.value.find(x => x.track === t.metadata.trackNumber)
-        if (!s) continue
+        if (!s || s.format === 'pgs') continue   // extractor 对 PGS 输出乱码，走 get_subtitle_bin
         const text = new TextDecoder().decode(t.output.subtitle)
-        s.text = text
+        setText(s, text)
+        texts[t.metadata.trackNumber] = text
         embeddedFonts.set(t.metadata.trackNumber, (t.output.fonts || []).map(f => f.data))   // 只留字节，不进响应式对象
-        if (s.format !== 'ass' && s.format !== 'ssa') {
-          const vtt = s.format === 'srt' ? srtToVtt(text) : s.format === 'vtt' ? text : null
-          if (vtt) s.blobUrl = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }))
-        }
       }
+      if (Object.keys(texts).length) invoke('save_sub_cache', { fileId: p.file_id, texts }).catch(() => {})
     })().catch(e => { extractPromise = null; throw e })
   }
   return extractPromise
 }
 
-// 内嵌轨取文本：先走 Range 提取（快、带字体）；失败或轨号对不上回退后端提取
+// 内嵌轨取文本：缓存 → Range 提取（快、带字体）→ 失败回退后端提取
 async function fetchEmbeddedText(s) {
+  try {
+    const cached = await invoke('peek_sub_cache', { fileId: s.file_id, track: s.track })
+    if (cached != null) { setText(s, cached); return }
+  } catch {}
   try {
     await loadEmbedded()
     if (s.text != null) return
   } catch (e) {
     console.error('Range 提取失败，回退后端提取', e)
   }
-  s.text = await invoke('get_subtitle_text', { fileId: s.file_id, track: s.track })
-  if (s.format !== 'ass' && s.format !== 'ssa') {
-    const vtt = s.format === 'srt' ? srtToVtt(s.text) : s.format === 'vtt' ? s.text : null
-    if (vtt) s.blobUrl = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }))
-  }
+  setText(s, await invoke('get_subtitle_text', { fileId: s.file_id, track: s.track }))
 }
 function fmtVtt(ms) {
   ms = Math.max(0, Math.round(ms))
@@ -238,14 +249,41 @@ async function applySub() {
   const i = activeSub.value
   if (i < 0) return
   const s = subs.value[i]
-  // 内嵌轨：优先时间窗流式（边播边补）；容器不支持时回退整文件提取
-  if (s.track != null && s.windowed !== false) {
+  // PGS 位图字幕：libpgs 整轨加载（无分块 API），不走时间窗
+  if (s.format === 'pgs') {
+    showToast('正在加载 PGS 字幕…', 'spin')
     try {
-      await startStream(s, v)
-      return
+      const key = s.file_id + ':' + s.track
+      if (!pgsData.has(key)) {
+        const b64 = await invoke('get_subtitle_bin', { fileId: s.file_id, track: s.track })
+        pgsData.set(key, Uint8Array.from(atob(b64), c => c.charCodeAt(0)))
+      }
     } catch (e) {
-      console.warn('窗口流式加载不可用，回退整文件提取', e)
+      console.error('PGS 字幕加载失败', e)
+      showToast('PGS 字幕加载失败：' + e, 'alert', 3000)
+      return
+    }
+    hideToast()
+    if (activeSub.value !== i || video.value !== v) return   // 等待期间又切走了
+    pgs = new PgsRenderer({ video: v, workerUrl: pgsWorkerUrl })
+    await pgs.loadFromBuffer(pgsData.get(s.file_id + ':' + s.track))
+    return
+  }
+  // 内嵌轨：命中缓存秒开，否则时间窗流式（边播边补）；容器不支持时回退整文件提取
+  if (s.track != null && s.windowed !== false) {
+    let cached = null
+    try { cached = await invoke('peek_sub_cache', { fileId: s.file_id, track: s.track }) } catch {}
+    if (cached != null) {
       s.windowed = false
+      setText(s, cached)
+    } else {
+      try {
+        await startStream(s, v)
+        return
+      } catch (e) {
+        console.warn('窗口流式加载不可用，回退整文件提取', e)
+        s.windowed = false
+      }
     }
   }
   // 内嵌轨懒提取：首次选中才拉（一次提取全部轨，之后换轨零成本）
@@ -260,8 +298,9 @@ async function applySub() {
     }
     hideToast()
     if (activeSub.value !== i || video.value !== v) return   // 等待期间又切走了
-    await nextTick()   // 让 <track> 元素先渲染出来
   }
+  await nextTick()   // 让 <track> 元素先渲染出来
+  if (activeSub.value !== i || video.value !== v) return
   if (s.format === 'ass' || s.format === 'ssa') {
     // 中文字形靠系统字体（WebView2 的 queryLocalFonts 不一定可用），失败也要能渲拉丁字
     let fonts, defaultFont
@@ -294,6 +333,10 @@ function destroyAss() {
   if (ass) {
     try { ass.destroy() } catch {}
     ass = null
+  }
+  if (pgs) {
+    try { pgs.dispose() } catch {}
+    pgs = null
   }
 }
 

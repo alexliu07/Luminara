@@ -31,6 +31,8 @@ regex = "1"
 tokio = {version = "1", features = ["time"] }
 tiny_http = "0.12"
 encoding_rs = "0.8"
+base64 = "0.22"
+flate2 = "1"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

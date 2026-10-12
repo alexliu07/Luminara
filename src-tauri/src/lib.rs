@@ -10,6 +10,7 @@ use tauri::Manager;
 use tauri_plugin_dialog::DialogExt;
 use rusqlite::{params, Connection, OptionalExtension};
 use regex::Regex;
+use base64::Engine;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 // 文件源结构体
@@ -1256,7 +1257,31 @@ fn cache_get(app: &tauri::AppHandle, file_id: i64, size: i64, track: u32) -> Opt
 fn cache_put(app: &tauri::AppHandle, file_id: i64, size: i64, texts: &HashMap<u32, String>) {
     let p = sub_cache_path(app, file_id, size);
     if let Some(d) = p.parent() { let _ = fs::create_dir_all(d); }
-    if let Ok(s) = serde_json::to_string(texts) { let _ = fs::write(p, s); }
+    // 合并写：单轨缓存别把其他轨盖掉
+    let mut map = fs::read_to_string(&p).ok()
+        .and_then(|s| serde_json::from_str::<HashMap<u32, String>>(&s).ok())
+        .unwrap_or_default();
+    for (k, v) in texts { map.insert(*k, v.clone()); }
+    if let Ok(s) = serde_json::to_string(&map) { let _ = fs::write(p, s); }
+}
+// 按文件 id 查 size（缓存键要用）
+fn file_size(app: &tauri::AppHandle, file_id: i64) -> Result<i64, String> {
+    let db = open_db(app)?;
+    db.query_row("SELECT size FROM files WHERE id = ?1", params![file_id], |r| r.get(0))
+        .optional().map_err(|e| e.to_string())?
+        .ok_or_else(|| "文件不存在".to_string())
+}
+// PGS .sup 缓存：{file_id}_{size}_{track}.sup 原始字节
+fn bin_cache_path(app: &tauri::AppHandle, file_id: i64, size: i64, track: u32) -> std::path::PathBuf {
+    app.path().app_data_dir().expect("配置目录不可用").join("sub_cache").join(format!("{}_{}_{}.sup", file_id, size, track))
+}
+fn bin_cache_get(app: &tauri::AppHandle, file_id: i64, size: i64, track: u32) -> Option<Vec<u8>> {
+    fs::read(bin_cache_path(app, file_id, size, track)).ok()
+}
+fn bin_cache_put(app: &tauri::AppHandle, file_id: i64, size: i64, track: u32, data: &[u8]) {
+    let p = bin_cache_path(app, file_id, size, track);
+    if let Some(d) = p.parent() { let _ = fs::create_dir_all(d); }
+    let _ = fs::write(p, data);
 }
 // 系统中文字体文件（给 ASS 渲染用）
 #[derive(Serialize)]
@@ -1321,7 +1346,7 @@ fn get_playback_info(app: tauri::AppHandle, file_id: i64)->Result<PlaybackInfo, 
             _ => Err("不支持的文件源类型".into()),
         };
         match res {
-            Ok(p) => for t in p.tracks.into_iter().filter(|t| t.is_text()) {
+            Ok(p) => for t in p.tracks.into_iter().filter(|t| t.is_text() || t.is_pgs()) {
                 subtitles.push(SubtitleItem{
                     file_id,
                     track: Some(t.number),
@@ -1384,10 +1409,14 @@ async fn get_subtitle_text(app: tauri::AppHandle, file_id: i64, track: Option<u3
     }
     match source {
         0 => {
+            if let Some(t) = cache_get(&app, file_id, size, 0) { return Ok(t) }   // 外挂字幕约定 track=0
             let abs = std::path::Path::new(&data_a).join(&rel);
-            Ok(decode_text(&fs::read(&abs).map_err(|e|e.to_string())?))
+            let text = decode_text(&fs::read(&abs).map_err(|e|e.to_string())?);
+            cache_put(&app, file_id, size, &HashMap::from([(0, text.clone())]));
+            Ok(text)
         }
         1 => {
+            if let Some(t) = cache_get(&app, file_id, size, 0) { return Ok(t) }
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(20))
                 .build().map_err(|e|e.to_string())?;
@@ -1399,12 +1428,70 @@ async fn get_subtitle_text(app: tauri::AppHandle, file_id: i64, track: Option<u3
             if !resp.status().is_success() {
                 return Err(format!("字幕下载失败（HTTP {}）", resp.status().as_u16()));
             }
-            Ok(decode_text(&resp.bytes().await.map_err(|e|e.to_string())?))
+            let text = decode_text(&resp.bytes().await.map_err(|e|e.to_string())?);
+            cache_put(&app, file_id, size, &HashMap::from([(0, text.clone())]));
+            Ok(text)
         }
         _ => Err("不支持的文件源类型".into()),
     }
 }
-
+// PGS 位图字幕：整轨提取拼成 .sup 流，base64 返回（前端 libpgs.loadFromBuffer 直接用）
+#[tauri::command]
+async fn get_subtitle_bin(app: tauri::AppHandle, file_id: i64, track: u32) -> Result<String, String> {
+    let row: Option<(String, i64, i32, String, Option<String>, Option<String>)> = {
+        let db = open_db(&app)?;
+        db.query_row(
+            "SELECT f.rel_path, f.size, s.source, s.data_a, s.data_e, s.data_f FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
+            params![file_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
+        ).optional().map_err(|e|e.to_string())?
+    };
+    let Some((rel, size, source, data_a, user, pass)) = row else { return Err("文件不存在或已被删除".into()) };
+    if let Some(raw) = bin_cache_get(&app, file_id, size, track) {
+        return Ok(base64::engine::general_purpose::STANDARD.encode(&raw));
+    }
+    // 整轨提取（WebDAV 要通读容器，放 blocking 线程里跑）
+    let parsed: Result<mkv::Parse, String> = match source {
+        0 => {
+            let abs = std::path::Path::new(&data_a).join(&rel);
+            tokio::task::spawn_blocking(move || mkv::parse_local(&abs.to_string_lossy(), true))
+                .await.map_err(|e| e.to_string())?
+        }
+        1 => {
+            let (url, user, pass) = (webdav_url(&data_a, &rel), user.unwrap_or_default(), pass.unwrap_or_default());
+            tokio::task::spawn_blocking(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .connect_timeout(std::time::Duration::from_secs(10))
+                    .timeout(std::time::Duration::from_secs(600))
+                    .build().map_err(|e| e.to_string())?;
+                let mut req = client.get(url).header("Accept-Encoding", "identity");
+                if !user.is_empty() { req = req.basic_auth(user, Some(pass)); }
+                let resp = req.send().map_err(|e| e.to_string())?;
+                if !resp.status().is_success() {
+                    return Err(format!("下载失败（HTTP {}）", resp.status().as_u16()));
+                }
+                Ok(mkv::parse_stream(resp, true))
+            }).await.map_err(|e| e.to_string())?
+        }
+        _ => Err("不支持的文件源类型".into()),
+    };
+    let sup = parsed?.build_sup(track);
+    if sup.is_empty() { return Err("内嵌轨不存在或没有 PGS 数据".into()) }
+    bin_cache_put(&app, file_id, size, track, &sup);
+    Ok(base64::engine::general_purpose::STANDARD.encode(&sup))
+}
+// 字幕缓存读写：前端 Range 提取的结果也落盘，重复播放秒开
+#[tauri::command]
+fn peek_sub_cache(app: tauri::AppHandle, file_id: i64, track: u32) -> Result<Option<String>, String> {
+    let size = file_size(&app, file_id)?;
+    Ok(cache_get(&app, file_id, size, track))
+}
+#[tauri::command]
+fn save_sub_cache(app: tauri::AppHandle, file_id: i64, texts: HashMap<u32, String>) -> Result<(), String> {
+    let size = file_size(&app, file_id)?;
+    cache_put(&app, file_id, size, &texts);
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1419,7 +1506,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work, get_playback_info, get_subtitle_text, get_cjk_fonts])
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work, get_playback_info, get_subtitle_text, get_subtitle_bin, peek_sub_cache, save_sub_cache, get_cjk_fonts])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
