@@ -195,11 +195,48 @@ const playSrc = computed(() => {
 })
 // 走原生 <track> 的字幕（srt 已转 vtt blob）
 const textSubs = computed(() => subs.value.map((s, i) => ({ s, i })).filter(x => x.s.blobUrl))
-// TODO: 播放进度记忆（记住 currentTime 与 file_id，重返本集时续播）
+
+// ===== 播放进度记忆 =====
+let epInfo = null        // { season, episode }，刮削到分集才入历史
+let resumeAt = 0         // 续播位置（秒）
+let lastSave = 0
+function saveProgress(force = false) {
+  const v = video.value
+  if (!v || !epInfo) return              // 没刮削到的文件不记
+  const now = Date.now()
+  if (!force && now - lastSave < 5000) return   // 播放中 5 秒落一次盘
+  lastSave = now
+  invoke('update_progress', {
+    tmdb: Number(route.params.tmdb),
+    kind: route.params.kind,
+    fileId: Number(route.params.fileId),
+    season: epInfo.season,
+    episode: epInfo.episode,
+    position: v.currentTime || 0,
+    duration: v.duration || 0,
+  }).catch(() => {})
+}
+// 模板直接绑 saveProgress 会把事件对象当 force 传进来，这里包一层
+function onTick() { saveProgress(false) }
+function onPause() { showUi(); saveProgress(true) }
+function onEnded() { showUi(); saveProgress(true) }   // 播完落盘即 100%
+function onMeta() {
+  const v = video.value
+  if (!v || !resumeAt) return
+  const d = v.duration
+  if (d && resumeAt > d - 30) return     // 剩不到 30 秒就从头播
+  v.currentTime = resumeAt
+  resumeAt = 0
+}
+
 onMounted(async () => {
   window.addEventListener('mousemove', pokeUi)
   try {
-    const p = await invoke('get_playback_info', { fileId: Number(route.params.fileId) })
+    const [p, resume] = await Promise.all([
+      invoke('get_playback_info', { fileId: Number(route.params.fileId) }),
+      invoke('get_resume', { tmdb: Number(route.params.tmdb), kind: route.params.kind, fileId: Number(route.params.fileId) }).catch(() => null),
+    ])
+    resumeAt = resume || 0
     const list = []
     for (const s of p.subtitles) {
       if (s.track != null) { list.push({ ...s, text: null, blobUrl: null }); continue }  // 内嵌轨选中时才提取
@@ -216,6 +253,7 @@ onMounted(async () => {
     getWork(route.params.tmdb, route.params.kind).then(w => {
       const ep = (w.episodes || []).find(e => e.file_id === Number(route.params.fileId))
       if (!ep) return        // 没刮削到的文件：保留文件名
+      epInfo = { season: ep.season, episode: ep.episode }
       title.value = ep.episode > 0
           ? `第${ep.episode}话 ${ep.title}`.trim()
           : (ep.title || p.name)   // 电影条目没有集号，直接作品名
@@ -227,6 +265,7 @@ onMounted(async () => {
 })
 
 onBeforeUnmount(() => {
+  saveProgress(true)   // 退出前强制落盘（此时 video 还在）
   destroyAss()
   window.removeEventListener('mousemove', pokeUi)
   clearTimeout(hideTimer)
@@ -375,7 +414,8 @@ function onBack() {
     <div class="p-stage">
       <video-player v-if="playSrc">
         <video-skin>
-          <video ref="video" :src="playSrc" playsinline @pause="showUi" @ended="showUi">
+          <video ref="video" :src="playSrc" playsinline @pause="onPause" @ended="onEnded"
+                 @timeupdate="onTick" @loadedmetadata="onMeta">
             <track v-for="x in textSubs" :key="x.i" kind="subtitles" :src="x.s.blobUrl"
                    :label="x.s.label" :data-sub="x.i" />
           </video>

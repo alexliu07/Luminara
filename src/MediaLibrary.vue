@@ -1,5 +1,5 @@
 <script setup>
-import {ref, computed, onMounted} from 'vue'
+import {ref, computed, onMounted, onActivated} from 'vue'
 import { invoke, convertFileSrc } from '@tauri-apps/api/core'
 import { useRouter } from 'vue-router'
 import { usePageScroller } from './scroll.js'
@@ -69,24 +69,29 @@ function openAll(name) {
   getUnscraped();
   router.push('/all/' + encodeURIComponent(name))
 }
-// ── 样例数据 ─────────────────────────────────────────────
-
-const continueRow = {
+// ── 继续观看：每部作品最近一集，按观看时间倒序 ────────────
+const history = ref([])
+async function loadHistory() {
+  try { history.value = await invoke('list_continue_watching') }
+  catch (e) { console.error('加载继续观看失败', e) }
+}
+onActivated(loadHistory)   // MediaLibrary 在 KeepAlive 里，从播放页返回不会重新 onMounted，靠激活刷新
+const continueRow = computed(() => ({
   title: '继续观看',
-  items: [
-    {
-      title: '不时用俄语小声说真心话的邻桌艾莉…',
-      sub: '第1季 第12话',
-      colors: ['#6d7fa8', '#c7d2e8'],
-      progress: 0.45,
-    },
-    {
-      title: '想吃掉我的非人少女',
-      sub: '第1季 第5话',
-      colors: ['#8a6f9e', '#e2c4d8'],
-      progress: 0.2,
-    },
-  ],
+  items: history.value.map(h => ({
+    key: 'c' + h.kind + h.tmdb_id,
+    tmdb: h.tmdb_id,
+    kind: h.kind,
+    file_id: h.file_id,
+    title: h.title,
+    sub: h.kind === 'tv' ? `第${h.season}季 第${h.episode}话` : '电影',
+    cover: h.still ? convertFileSrc(h.still) : (h.backdrop ? convertFileSrc(h.backdrop) : null),
+    progress: h.duration > 0 ? Math.min(1, h.position / h.duration) : 0,
+  })),
+}))
+function openContinue(it) {
+  if (justDragged) return
+  router.push(`/play/${it.kind}/${it.tmdb}/${it.file_id}`)   // 播放页自己 seek 回进度
 }
 
 // ── 真实数据 ─────────────────────────────────────────────
@@ -233,14 +238,15 @@ const emptyColors = ['#4a4a52', '#2e2e34']   // 无封面占位色
         </header>
 
         <!-- 继续观看 -->
-        <section class="sec">
+        <section class="sec" v-if="continueRow.items.length">
           <div class="sec-head">
             <h2 class="sec-title">{{ continueRow.title }}</h2>
             <a class="sec-more">查看全部 <svg class="ic ic-sm"><use href="#i-chevron" /></svg></a>
           </div>
           <div class="row" @mousedown.left="rowDrag">
-            <article class="w-card" v-for="item in continueRow.items" :key="item.title">
-              <div class="w-art" :style="{ background: grad(item.colors) }">
+            <article class="w-card" v-for="item in continueRow.items" :key="item.key" @click="openContinue(item)">
+              <div class="w-art" :style="item.cover ? {} : { background: grad(emptyColors) }">
+                <img v-if="item.cover" class="p-img" :src="item.cover" :alt="item.title" draggable="false" />
                 <svg class="ic ic-lg w-play"><use href="#i-play-circle" /></svg>
                 <div class="w-progress"><i :style="{ width: item.progress * 100 + '%' }"></i></div>
               </div>

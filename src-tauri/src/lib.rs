@@ -91,6 +91,21 @@ struct EpisodeItem{
     still: Option<String>,   // 缓存绝对路径
     size: i64,
 }
+// 继续观看条目：每部作品最近一集的进度
+#[derive(Serialize)]
+struct ContinueItem{
+    tmdb_id: i64,
+    kind: String,
+    title: String,
+    still: Option<String>,      // 分集封面（缓存绝对路径）
+    backdrop: Option<String>,   // 兜底：作品背景
+    season: i32,
+    episode: i32,
+    file_id: i64,
+    position: f64,
+    duration: f64,
+    updated_at: String,
+}
 // 演职人员条目
 #[derive(Serialize)]
 struct CastItem{
@@ -198,6 +213,18 @@ fn init_db(db: &Connection)->Result<(), String>{
             seasons        TEXT NOT NULL DEFAULT '[]',-- JSON:[{season, name, poster, episodes:[{file_id, episode, title, still}]}]
             cast_json      TEXT NOT NULL DEFAULT '[]',-- JSON：[{name, character, photo}]
             UNIQUE(tmdb_id, kind)
+        );",).map_err(|e|e.to_string())?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS watch_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            tmdb_id    INTEGER NOT NULL,               -- TMDB 作品 id
+            kind       TEXT NOT NULL,                  -- tv / movie
+            file_id    INTEGER NOT NULL,               -- 最近观看的分集文件
+            season     INTEGER NOT NULL DEFAULT 0,
+            episode    INTEGER NOT NULL DEFAULT 0,
+            position   REAL NOT NULL DEFAULT 0,        -- 播放位置（秒）
+            duration   REAL NOT NULL DEFAULT 0,        -- 该集时长（秒）
+            updated_at TEXT DEFAULT (datetime('now')), -- 最近观看时间
+            UNIQUE(tmdb_id, kind)                      -- 每部作品只留最新一集
         );",).map_err(|e|e.to_string())?;
     Ok(())
 }
@@ -1493,6 +1520,78 @@ fn save_sub_cache(app: tauri::AppHandle, file_id: i64, texts: HashMap<u32, Strin
     Ok(())
 }
 
+// ==================== 观看历史 ====================
+// 记录播放进度：按 (tmdb_id, kind) upsert，每部作品只留最近一集
+#[tauri::command]
+fn update_progress(app: tauri::AppHandle, tmdb: i64, kind: String, file_id: i64, season: i32, episode: i32, position: f64, duration: f64)->Result<(), String>{
+    let db = open_db(&app)?;
+    db.execute(
+        "INSERT INTO watch_history (tmdb_id, kind, file_id, season, episode, position, duration, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, datetime('now'))
+         ON CONFLICT(tmdb_id, kind) DO UPDATE SET
+             file_id = excluded.file_id, season = excluded.season, episode = excluded.episode,
+             position = excluded.position, duration = excluded.duration,
+             updated_at = datetime('now')",
+        params![tmdb, kind, file_id, season, episode, position, duration],
+    ).map_err(|e|e.to_string())?;
+    Ok(())
+}
+// 本集续播位置：只有「最近在看的那一集」有记录
+#[tauri::command]
+fn get_resume(app: tauri::AppHandle, tmdb: i64, kind: String, file_id: i64)->Result<Option<f64>, String>{
+    let db = open_db(&app)?;
+    let v: Option<f64> = db.query_row(
+        "SELECT position FROM watch_history WHERE tmdb_id = ?1 AND kind = ?2 AND file_id = ?3",
+        params![tmdb, kind, file_id], |r| r.get(0),
+    ).optional().map_err(|e|e.to_string())?;
+    Ok(v)
+}
+// 继续观看列表：按最近观看倒序；作品/文件已删的行自动被 JOIN 滤掉
+#[tauri::command]
+fn list_continue_watching(app: tauri::AppHandle)->Result<Vec<ContinueItem>, String>{
+    let db = open_db(&app)?;
+    let dir = img_cache_dir(&app);
+    let cached = |p: &Option<String>| -> Option<String> {
+        p.as_ref().map(|p| dir.join(p.rsplit('/').next().unwrap_or("")))
+            .filter(|f| f.exists() && f.is_file())
+            .map(|f| f.to_string_lossy().to_string())
+    };
+    let mut stmt = db.prepare(
+        "SELECT h.tmdb_id, h.kind, h.file_id, h.season, h.episode, h.position, h.duration, h.updated_at,
+                w.title, w.backdrop, w.seasons
+         FROM watch_history h
+         JOIN works w ON w.tmdb_id = h.tmdb_id AND w.kind = h.kind
+         JOIN files f ON f.id = h.file_id
+         ORDER BY h.updated_at DESC").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map([], |r| Ok((
+        r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i32>(3)?,
+        r.get::<_,i32>(4)?, r.get::<_,f64>(5)?, r.get::<_,f64>(6)?, r.get::<_,String>(7)?,
+        r.get::<_,String>(8)?, r.get::<_,Option<String>>(9)?, r.get::<_,String>(10)?,
+    ))).map_err(|e|e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (tmdb_id, kind, file_id, season, episode, position, duration, updated_at,
+             title, backdrop, seasons) = row.map_err(|e|e.to_string())?;
+        // seasons JSON 里按 file_id 找分集封面（同 get_work 的扁平化思路）
+        let v: Value = serde_json::from_str(&seasons).unwrap_or_else(|_| json!([]));
+        let mut still: Option<String> = None;
+        'outer: for g in v.as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+            for e in g["episodes"].as_array().map(|a| a.as_slice()).unwrap_or(&[]) {
+                if e["file_id"].as_i64() == Some(file_id) {
+                    still = e["still"].as_str().map(|s| s.to_string());
+                    break 'outer;
+                }
+            }
+        }
+        out.push(ContinueItem{
+            tmdb_id, kind, title,
+            still: cached(&still), backdrop: cached(&backdrop),
+            season, episode, file_id, position, duration, updated_at,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -1506,7 +1605,7 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work, get_playback_info, get_subtitle_text, get_subtitle_bin, peek_sub_cache, save_sub_cache, get_cjk_fonts])
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work, get_playback_info, get_subtitle_text, get_subtitle_bin, peek_sub_cache, save_sub_cache, get_cjk_fonts, update_progress, get_resume, list_continue_watching])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
