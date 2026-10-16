@@ -182,6 +182,110 @@ pub fn parse_stream<R: Read>(r: R, full: bool) -> Parse {
     parse(&mut StreamIo { r }, full)
 }
 
+// ---------- 远程随机读：经本地代理按 Range 取 ----------
+// 128KB 预读：块头是连续小读，命中缓冲；skip 只挪游标不发请求，
+// 所以音视频 payload 一个字节都不下载（对比 parse_stream 的整容器流读）
+struct HttpIo {
+    client: reqwest::blocking::Client,
+    url: String,
+    pos: u64,               // 逻辑读位置
+    buf: Vec<u8>,           // 预读缓冲
+    buf_off: u64,           // 缓冲起始对应的文件偏移
+    size: Option<u64>,      // 文件总长（首个 206 的 Content-Range 里带）
+    err: Option<String>,    // 真出错标记：只认网络/协议错误，EOF 不算
+}
+impl HttpIo {
+    fn new(url: &str) -> Result<Self, String> {
+        let client = reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(300))
+            .build().map_err(|e| e.to_string())?;
+        Ok(Self { client, url: url.to_string(), pos: 0, buf: Vec::new(), buf_off: 0, size: None, err: None })
+    }
+    fn fail(&mut self, msg: String) -> std::io::Error {
+        self.err = Some(msg.clone());
+        std::io::Error::new(std::io::ErrorKind::Other, msg)
+    }
+    // 读到末尾：解析器本来就靠 EOF 结束遍历，不能当失败记
+    fn eof() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "eof")
+    }
+    // 从当前 pos 起预读一段
+    fn fill(&mut self) -> std::io::Result<()> {
+        // 读位置是连续推进的（每个块要么读要么跳，顺序覆盖全文件），所以窗口开大不增加
+        // 总下载量，只减少请求次数 —— 请求次数才是延迟瓶颈。跳过大 payload 时窗口越大
+        // 省得越少，512KB 是这两者之间的折中
+        const CHUNK: u64 = 512 * 1024;
+        if let Some(n) = self.size {
+            if self.pos >= n { return Err(Self::eof()) }
+        }
+        // 末尾收口：Range 终点别越过文件末尾，免得被上游按越界回 416
+        let end = match self.size {
+            Some(n) => (self.pos + CHUNK - 1).min(n - 1),
+            None => self.pos + CHUNK - 1,
+        };
+        let resp = self.client.get(&self.url)
+            .header("Range", format!("bytes={}-{}", self.pos, end))
+            .send();
+        let resp = match resp {
+            Ok(r) => r,
+            Err(e) => return Err(self.fail(format!("无法连接播放代理：{}", e))),
+        };
+        let status = resp.status().as_u16();
+        // 416 = 请求起点已过文件末尾（RFC 对越界 Range 的标准回应），等价 EOF
+        if status == 416 { return Err(Self::eof()) }
+        // 只认 206：返回 200 说明上游忽略了 Range，拿到的字节不在请求偏移上
+        if status != 206 {
+            return Err(self.fail(format!("代理返回 {}，无法定点读取", status)));
+        }
+        // Content-Range: bytes 0-131071/1234567890 → 记下总长，后续请求就能收口
+        if self.size.is_none() {
+            if let Some(total) = resp.headers().get("Content-Range")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.rsplit('/').next())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .filter(|t| *t > 0) {          // 0 会让下面的 n-1 下溢
+                self.size = Some(total);
+            }
+        }
+        match resp.bytes() {
+            Ok(b) if !b.is_empty() => { self.buf_off = self.pos; self.buf = b.to_vec(); Ok(()) }
+            Ok(_) => Err(Self::eof()),
+            Err(e) => Err(self.fail(e.to_string())),
+        }
+    }
+}
+impl MkvIo for HttpIo {
+    fn read_exact(&mut self, out: &mut [u8]) -> std::io::Result<()> {
+        let mut done = 0;
+        while done < out.len() {
+            if self.pos < self.buf_off || self.pos >= self.buf_off + self.buf.len() as u64 {
+                self.fill()?;
+            }
+            let off = (self.pos - self.buf_off) as usize;
+            let n = (self.buf.len() - off).min(out.len() - done);
+            if n == 0 { return Err(self.fail("读取越界".into())) }
+            out[done..done + n].copy_from_slice(&self.buf[off..off + n]);
+            done += n;
+            self.pos += n as u64;
+        }
+        Ok(())
+    }
+    fn skip(&mut self, n: u64) -> std::io::Result<()> {
+        self.pos += n;
+        Ok(())
+    }
+}
+// 经本地代理 Range 解析（WebDAV 用），URL 传 http://127.0.0.1:{port}/dav/{file_id}
+pub fn parse_http(url: &str, full: bool) -> Result<Parse, String> {
+    let mut io = HttpIo::new(url)?;
+    let p = parse(&mut io, full);
+    match io.err {
+        Some(e) => Err(e),      // 半途断流按失败处理，缓存里不落残缺结果
+        None => Ok(p),
+    }
+}
+
 fn parse(io: &mut dyn MkvIo, full: bool) -> Parse {
     let mut st = State { scale: 1_000_000, full, done: false, out: Parse::default() };
     loop {

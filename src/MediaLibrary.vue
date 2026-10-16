@@ -1,9 +1,11 @@
 <script setup>
-import {ref, computed, onMounted, onActivated} from 'vue'
+import {ref, computed, onMounted, onActivated, onDeactivated, nextTick} from 'vue'
 import { invoke, convertFileSrc } from '@tauri-apps/api/core'
 import { useRouter } from 'vue-router'
 import { usePageScroller } from './scroll.js'
 import {getUnscraped, getWork, getWorks} from "./data.js";
+import { showToast, hideToast } from './toast.js'
+import { extractSubtitles } from '@cryguy/mkv-subtitle-extractor'
 
 const router = useRouter()
 const scroller = usePageScroller()
@@ -92,6 +94,219 @@ const continueRow = computed(() => ({
 function openContinue(it) {
   if (justDragged) return
   router.push(`/play/${it.kind}/${it.tmdb}/${it.file_id}`)   // 播放页自己 seek 回进度
+}
+
+// ── 右上角菜单 ───────────────────────────────────────────
+const menuOpen = ref(false)
+const scanning = ref(false)   // 防重复触发（扫描里含刮削，可能跑很久）
+// 扫描全部文件源（本地 + WebDAV），结束后刷新整页数据
+async function scanAll() {
+  menuOpen.value = false
+  if (scanning.value) return
+  scanning.value = true
+  let added = 0, removed = 0, updated = 0
+  showToast('正在扫描文件源', 'spin')
+  try {
+    const list = await invoke('list_sources')
+    if (!list.length) {
+      hideToast()
+      showToast('还没有添加文件源', 'alert', 2000)
+      return
+    }
+    for (const s of list) {
+      const n = s.source === 0
+          ? await invoke('index_local_source', { id: s.id })
+          : await invoke('index_webdav_source', { id: s.id })
+      added += n.added
+      removed += n.removed
+      updated += n.updated
+    }
+    window.dispatchEvent(new Event('library-refresh'))   // 让 data.js 丢掉页面缓存
+    works.value = await invoke('list_works')
+    unscraped.value = await invoke('list_unscraped')
+    pickHeroes()
+    loadHistory()   // 刚刮削出来的作品要重新查才进得了「继续观看」
+    hideToast()
+    showToast(`扫描完毕，添加了 ${added} 个文件，删除了 ${removed} 个文件，更新了 ${updated} 个文件`, 'check', 2000)
+  } catch (e) {
+    hideToast()
+    showToast('扫描失败：' + e, 'alert', 3000)
+  } finally {
+    scanning.value = false
+  }
+}
+
+// 缓存所有字幕：后端先给清单（已缓存的跳过），这里逐个跑，好显示进度和随时叫停
+const caching = ref(false)
+const cancelCache = ref(false)
+function onCacheSubtitles() {
+  if (caching.value) { cancelCache.value = true; return }   // 缓存中再点一次=停止
+  cacheAllSubtitles()
+}
+async function cacheAllSubtitles() {
+  menuOpen.value = false
+  if (caching.value) return
+  caching.value = true
+  cancelCache.value = false
+  let done = 0, tracks = 0, failed = 0
+  showToast('正在统计待缓存的字幕…', 'spin')
+  try {
+    const targets = await invoke('list_cache_targets')
+    if (!targets.length) {
+      hideToast()
+      showToast('没有需要缓存的文件', 'check', 2000)
+      return
+    }
+    for (const t of targets) {
+      if (cancelCache.value) {
+        hideToast()
+        showToast(`已停止：缓存了 ${tracks} 条字幕轨`, 'check', 2500)
+        return
+      }
+      done++
+      showToast(`缓存字幕 ${done}/${targets.length}${t.online ? '（在线）' : ''}：${t.name}`, 'spin')
+      try {
+        tracks += await cacheOne(t)
+      } catch (e) {
+        failed++
+        console.warn('字幕缓存失败', t.name, e)
+      }
+    }
+    hideToast()
+    showToast(`字幕缓存完成：${targets.length} 个文件，${tracks} 条字幕轨` + (failed ? `，${failed} 个失败` : ''), 'check', 3000)
+  } catch (e) {
+    hideToast()
+    showToast('缓存失败：' + e, 'alert', 3000)
+  } finally {
+    caching.value = false
+  }
+}
+// 单个文件：在线且全是文本轨的走前端提取器 —— 它按 Cues 直接跳字幕块 + 8 并发，
+// 通常只读整文件的几个百分点；后端的整解要遍历每个簇和块头，在线源慢得多。
+// 本地文件仍走后端（seek 跳读本来就快），带 PGS / zlib 压缩轨的也走后端（提取器不认这两种）
+async function cacheOne(target) {
+  if (!target.online) return invoke('cache_subtitle', { fileId: target.file_id })
+  const p = await invoke('get_playback_info', { fileId: target.file_id })
+  const emb = p.subtitles.filter(s => s.track != null)
+  // 一条内嵌轨都没有：轨清单刚才已经拿到了，不用再叫后端整解一遍，直接写个空标记
+  if (!emb.length) {
+    await invoke('save_sub_cache', { fileId: p.file_id, texts: {} })
+    return 0
+  }
+  const hard = emb.filter(s => s.format === 'pgs' || s.comp !== 0xFF)
+  // 有 PGS / 压缩轨：后端整解一次，顺带把文本轨也解了，别跑两遍
+  if (hard.length) return invoke('cache_subtitle', { fileId: target.file_id })
+  const t0 = performance.now()
+  const list = await extractSubtitles(p.src, { concurrency: 8, allowFullDownload: true })
+  const texts = {}
+  for (const tr of list) {
+    const s = emb.find(x => x.track === tr.metadata.trackNumber)
+    if (s) texts[tr.metadata.trackNumber] = new TextDecoder().decode(tr.output.subtitle)
+  }
+  console.log(`[字幕缓存] ${target.name}：${Object.keys(texts).length} 轨，用时 ${(performance.now() - t0).toFixed(0)}ms`)
+  await invoke('save_sub_cache', { fileId: p.file_id, texts })   // 空结果也写，标记解过了
+  return Object.keys(texts).length
+}
+
+// ── 继续观看：右键菜单 + 删除确认 ────────────────────────
+const ctxOpen = ref(false)
+const ctxX = ref(0)
+const ctxY = ref(0)
+const ctxItem = ref(null)
+const ctxMenuEl = ref(null)
+const confirmOpen = ref(false)
+// 界面按 --ui-scale 缩放，鼠标坐标要换算回布局坐标
+function uiScale() {
+  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue('--ui-scale')) || 1
+}
+// 右键弹菜单：贴着鼠标，量出尺寸后夹在视口内
+function openCtx(e, item) {
+  const scale = uiScale()
+  const x = e.clientX / scale
+  const y = e.clientY / scale
+  ctxItem.value = item
+  ctxX.value = x
+  ctxY.value = y
+  ctxOpen.value = true
+  menuOpen.value = false   // 顺手关掉右上角菜单
+
+  nextTick(() => {
+    const el = ctxMenuEl.value
+    if (!el) return
+    const m = 8   // 离边最小留白
+    ctxX.value = Math.max(m, Math.min(x, window.innerWidth / scale - el.offsetWidth - m))
+    ctxY.value = Math.max(m, Math.min(y, window.innerHeight / scale - el.offsetHeight - m))
+  })
+}
+// 被 KeepAlive 缓存起来（切 tab / 进播放页）时收起所有浮层，回来不会剩个菜单挂着
+onDeactivated(() => {
+  menuOpen.value = false
+  ctxOpen.value = false
+  confirmOpen.value = false
+  closeSearch()
+})
+function onDeleteRecord() {
+  ctxOpen.value = false
+  confirmOpen.value = true
+}
+function onCancelDelete() {
+  confirmOpen.value = false
+}
+async function onConfirmDelete() {
+  confirmOpen.value = false
+  const it = ctxItem.value
+  if (!it) return
+  try {
+    await invoke('delete_progress', { tmdb: it.tmdb, kind: it.kind })
+  } catch (e) {
+    showToast('删除失败：' + e, 'alert', 2500)
+    return
+  }
+  history.value = history.value.filter(h => !(h.tmdb_id === it.tmdb && h.kind === it.kind))   // 先本地移除
+  ctxItem.value = null
+  nextTick(() => window.dispatchEvent(new Event('resize')))   // 行高变了，让滚动条重算
+}
+
+// ── 搜索 ────────────────────────────────────────────────
+const searchOpen = ref(false)
+const q = ref('')
+const searchInput = ref(null)
+// 命中作品标题（大小写不敏感的子串），最多列 60 条
+const results = computed(() => {
+  const s = q.value.trim().toLowerCase()
+  if (!s) return []
+  return works.value
+      .filter(w => (w.title || '').toLowerCase().includes(s))
+      .slice(0, 60)
+      .map(w => ({
+        key: 's' + w.kind + w.tmdb_id,
+        tmdb: w.tmdb_id,
+        kind: w.kind,
+        title: w.title,
+        cover: w.poster ? convertFileSrc(w.poster) : null,
+        rating: w.rating ? w.rating.toFixed(1) : '',
+        sub: [w.kind === 'tv' ? `共${w.total_seasons ?? '?'}季` : '电影',
+              w.air_date ? w.air_date.slice(0, 4) : '', w.region || ''].filter(Boolean).join(' · '),
+      }))
+})
+function openSearch() {
+  menuOpen.value = false
+  ctxOpen.value = false
+  searchOpen.value = true
+  nextTick(() => searchInput.value?.focus())   // 展开后直接能打字
+}
+function closeSearch() {
+  searchOpen.value = false
+  q.value = ''
+}
+// 收起时点它=展开，展开后点它=回到输入框
+function onSearchFace() {
+  if (searchOpen.value) searchInput.value?.focus()
+  else openSearch()
+}
+function openResult(w) {
+  closeSearch()
+  openDetail({ tmdb: w.tmdb, kind: w.kind })
 }
 
 // ── 真实数据 ─────────────────────────────────────────────
@@ -201,14 +416,20 @@ const emptyColors = ['#4a4a52', '#2e2e34']   // 无封面占位色
     <Transition name="main">
       <div class="main-view">
         <div class="hero-bar">
-          <div class="hero-actions">
-            <button class="round-btn" type="button" aria-label="搜索">
-              <svg class="ic"><use href="#i-search" /></svg>
-            </button>
-            <button class="round-btn" type="button" aria-label="更多">
+          <div class="hero-actions" :class="{ faded: searchOpen }">
+            <button class="round-btn" type="button" aria-label="更多" @click="menuOpen = !menuOpen">
               <svg class="ic"><use href="#i-more" /></svg>
             </button>
           </div>
+          <div class="menu-backdrop" v-if="menuOpen || ctxOpen" @click="menuOpen = false; ctxOpen = false"></div>
+          <Transition name="menu">
+            <div class="src-menu" v-if="menuOpen">
+              <button class="src-menu-item" type="button" @click="scanAll">扫描文件源</button>
+              <button class="src-menu-item" type="button" @click="onCacheSubtitles">
+                {{ caching ? '停止缓存' : '缓存所有字幕' }}
+              </button>
+            </div>
+          </Transition>
         </div>
         <!-- 顶部 hero：作品轮播 -->
         <header class="hero" v-if="heroItems.length" @mousedown.left="heroDown">
@@ -241,10 +462,11 @@ const emptyColors = ['#4a4a52', '#2e2e34']   // 无封面占位色
         <section class="sec" v-if="continueRow.items.length">
           <div class="sec-head">
             <h2 class="sec-title">{{ continueRow.title }}</h2>
-            <a class="sec-more">查看全部 <svg class="ic ic-sm"><use href="#i-chevron" /></svg></a>
+            <a class="sec-more" @click="openAll(continueRow.title)">查看全部 <svg class="ic ic-sm"><use href="#i-chevron" /></svg></a>
           </div>
           <div class="row" @mousedown.left="rowDrag">
-            <article class="w-card" v-for="item in continueRow.items" :key="item.key" @click="openContinue(item)">
+            <article class="w-card" v-for="item in continueRow.items" :key="item.key"
+                     @click="openContinue(item)" @contextmenu.prevent="openCtx($event, item)">
               <div class="w-art" :style="item.cover ? {} : { background: grad(emptyColors) }">
                 <img v-if="item.cover" class="p-img" :src="item.cover" :alt="item.title" draggable="false" />
                 <svg class="ic ic-lg w-play"><use href="#i-play-circle" /></svg>
@@ -274,6 +496,58 @@ const emptyColors = ['#4a4a52', '#2e2e34']   // 无封面占位色
             </article>
           </div>
         </section>
+      </div>
+    </Transition>
+
+    <!-- 搜索：收起时就是右上角那个圆按钮（固定在它原来的位置），点开后滑成搜索条 -->
+    <Transition name="fade">
+      <div class="search-backdrop" v-if="searchOpen" @click="closeSearch"></div>
+    </Transition>
+    <div class="search-shell" :class="{ on: searchOpen }">
+      <button class="search-face" type="button" aria-label="搜索" @click="onSearchFace">
+        <svg class="ic"><use href="#i-search" /></svg>
+      </button>
+      <input v-if="searchOpen" ref="searchInput" class="search-input" v-model="q" placeholder="搜索作品"
+             @keydown.esc="closeSearch" @keydown.enter="results[0] && openResult(results[0])" />
+      <button v-if="searchOpen" class="search-cancel" type="button" @click="closeSearch">取消</button>
+    </div>
+    <Transition name="fade">
+      <div class="search-panel" v-if="searchOpen && q.trim()">
+        <p class="search-empty" v-if="!results.length">没有找到「{{ q.trim() }}」</p>
+        <ul class="search-list" v-else>
+          <li class="search-item" v-for="it in results" :key="it.key" @click="openResult(it)">
+            <div class="search-poster">
+              <img v-if="it.cover" :src="it.cover" :alt="it.title" draggable="false" />
+              <svg v-else class="ic"><use href="#i-video" /></svg>
+            </div>
+            <div class="search-body">
+              <h3 class="search-name">{{ it.title }}</h3>
+              <p class="search-meta">{{ it.sub }}</p>
+            </div>
+            <span class="search-rate" v-if="it.rating">{{ it.rating }}</span>
+          </li>
+        </ul>
+      </div>
+    </Transition>
+
+    <!-- 继续观看右键菜单：位置用鼠标坐标（同样按 --ui-scale 换算） -->
+    <Transition name="menu">
+      <div class="src-menu ctx-menu" ref="ctxMenuEl" v-if="ctxOpen" :style="{ left: ctxX + 'px', top: ctxY + 'px' }">
+        <button class="src-menu-item danger" type="button" @click="onDeleteRecord">删除记录</button>
+      </div>
+    </Transition>
+
+    <!-- 删除确认 -->
+    <Transition name="confirm">
+      <div class="confirm-backdrop" v-if="confirmOpen" @click="onCancelDelete">
+        <div class="confirm-box" @click.stop>
+          <h2 class="confirm-title">删除观看记录</h2>
+          <p class="confirm-text">确定要删除「{{ ctxItem?.title }}」的观看记录吗？</p>
+          <div class="confirm-actions">
+            <button class="confirm-btn" type="button" @click="onCancelDelete">取消</button>
+            <button class="confirm-btn danger" type="button" @click="onConfirmDelete">删除</button>
+          </div>
+        </div>
       </div>
     </Transition>
   </div>
@@ -363,6 +637,11 @@ const emptyColors = ['#4a4a52', '#2e2e34']   // 无封面占位色
 .hero-actions {
   display: flex;
   gap: 10px;
+  transition: opacity 0.2s ease;
+}
+.hero-actions.faded {          /* 搜索展开时让位给搜索条 */
+  opacity: 0;
+  pointer-events: none;
 }
 .round-btn {
   display: inline-flex;
@@ -381,6 +660,291 @@ const emptyColors = ['#4a4a52', '#2e2e34']   // 无封面占位色
       inset 0 -1px 0 rgba(255, 255, 255, 0.12),   /* 底部微反光 */
       0 4px 16px rgba(40, 25, 30, 0.25);
 }
+
+/* ── 右上角菜单：样式对齐文件源页面的添加菜单 ─────────── */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 18;              /* 比按钮低、比内容高 */
+}
+
+.src-menu {
+  position: fixed;
+  top: 56px;                /* 按钮 top14 + 高34 + 间距8 */
+  right: 14px;              /* 与按钮右对齐 */
+  z-index: 22;
+  min-width: 168px;
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  border-radius: 16px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(5px) saturate(180%);
+  -webkit-backdrop-filter: blur(5px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),
+      0 4px 16px rgba(40, 25, 30, 0.25);
+}
+
+.src-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  font-size: 13px;
+  color: var(--ink);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.src-menu-item:hover {
+  background: var(--option-bg);
+}
+
+/* 弹出动画：从按钮右上角弹出 */
+.menu-enter-active,
+.menu-leave-active {
+  transition: opacity 0.18s ease, transform 0.18s ease;
+  transform-origin: top right;
+}
+.menu-enter-from,
+.menu-leave-to {
+  opacity: 0;
+  transform: scale(0.92) translateY(-6px);
+}
+
+/* 右键菜单：位置由鼠标坐标给，清掉默认的右上角定位 */
+.ctx-menu {
+  top: auto;
+  right: auto;
+}
+.src-menu-item.danger {
+  color: #e5484d;
+}
+.src-menu-item.danger:hover {
+  background: rgba(229, 72, 77, 0.16);
+}
+
+/* ── 确认弹窗：样式对齐文件源页面 ───────────────────── */
+.confirm-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 40;                       /* 盖住菜单(22)和滚动条(30)，模态就该全盖 */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(20, 16, 18, 0.28); /* 压暗背景突出弹窗 */
+}
+.confirm-box {
+  width: min(320px, calc(100% - 48px));
+  padding: 18px 18px 14px;
+  border-radius: 18px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(5px) saturate(180%);
+  -webkit-backdrop-filter: blur(5px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),
+      0 4px 16px rgba(40, 25, 30, 0.25);
+}
+.confirm-title {
+  margin: 0 0 8px;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--ink);
+}
+.confirm-text {
+  margin: 0 0 16px;
+  font-size: 12px;
+  line-height: 1.6;
+  color: var(--sub);
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.confirm-btn {
+  padding: 8px 16px;
+  border: 0;
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.18);
+  font-size: 12px;
+  color: var(--ink);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.confirm-btn:hover {
+  background: rgba(255, 255, 255, 0.28);
+}
+.confirm-btn.danger {
+  background: #e5484d;
+  color: #ffffff;
+}
+.confirm-btn.danger:hover {
+  background: #f2555a;
+}
+.confirm-enter-active,
+.confirm-leave-active {
+  transition: opacity 0.18s ease;
+}
+.confirm-enter-from,
+.confirm-leave-to {
+  opacity: 0;
+}
+
+/* ── 搜索：圆按钮 ⇄ 搜索条 ──────────────────────────── */
+.search-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 34;              /* 盖住内容、胶囊栏(25)和滚动条(30)，低于确认弹窗(40) */
+  background: rgba(20, 16, 18, 0.18);
+  backdrop-filter: blur(14px) saturate(160%);
+  -webkit-backdrop-filter: blur(14px) saturate(160%);
+}
+.search-shell {
+  position: fixed;
+  top: 14px;
+  height: 34px;
+  z-index: 38;
+  /* 收起时正好占右上角搜索按钮那一格：右边 14 + 更多按钮 34 + 间距 10 = 58 */
+  left: calc(100% - 92px);
+  right: 58px;
+  display: flex;
+  align-items: center;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(5px) saturate(180%);
+  -webkit-backdrop-filter: blur(5px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),
+      0 4px 16px rgba(40, 25, 30, 0.25);
+  transition: left 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
+              right 0.3s cubic-bezier(0.2, 0.8, 0.2, 1),
+              border-radius 0.3s ease;
+}
+.search-shell.on {
+  left: calc(0% + 14px);    /* 写成 calc 是为了和收起态的 calc(100% - 92px) 分量插值 */
+  right: 14px;
+  border-radius: 14px;
+}
+.search-face {
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border: 0;
+  background: transparent;
+  color: var(--ink);
+  cursor: pointer;
+}
+.search-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  font-size: 13px;
+  color: var(--ink);
+  outline: none;
+}
+.search-cancel {
+  flex-shrink: 0;
+  padding: 0 12px;
+  border: 0;
+  background: transparent;
+  font-size: 12.5px;
+  color: var(--sub);
+  cursor: pointer;
+}
+.search-cancel:hover { color: var(--ink); }
+
+.search-panel {
+  position: fixed;
+  top: 58px;                /* 搜索条底边(14+34) + 10 */
+  left: 14px;
+  right: 14px;
+  z-index: 36;
+  max-height: calc(100vh / var(--ui-scale) - 120px);
+  overflow-y: auto;
+  scrollbar-width: none;
+  padding: 6px;
+  border-radius: 16px;
+  background: var(--glass-bg);
+  backdrop-filter: blur(5px) saturate(180%);
+  -webkit-backdrop-filter: blur(5px) saturate(180%);
+  border: 1px solid rgba(255, 255, 255, 0.28);
+  box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.45),
+      inset 0 -1px 0 rgba(255, 255, 255, 0.12),
+      0 4px 16px rgba(40, 25, 30, 0.25);
+}
+.search-panel::-webkit-scrollbar { display: none; }
+.search-empty {
+  margin: 0;
+  padding: 14px 12px;
+  font-size: 12.5px;
+  color: var(--sub);
+  text-align: center;
+}
+.search-list { margin: 0; padding: 0; list-style: none; }
+.search-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 8px;
+  border-radius: 12px;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.search-item:hover { background: var(--option-bg); }
+.search-poster {
+  flex-shrink: 0;
+  width: 30px;
+  aspect-ratio: 2 / 3;
+  border-radius: 5px;
+  overflow: hidden;
+  background: rgba(127, 127, 127, 0.12);
+  display: flex; align-items: center; justify-content: center;
+  color: rgba(255, 255, 255, 0.55);
+}
+.search-poster img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.search-body { flex: 1; min-width: 0; }
+.search-name {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.search-meta {
+  margin: 2px 0 0;
+  font-size: 11px;
+  color: var(--sub);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.search-rate {
+  flex-shrink: 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: #f2c14e;
+}
+
+.fade-enter-active,
+.fade-leave-active { transition: opacity 0.2s ease; }
+.fade-enter-from,
+.fade-leave-to { opacity: 0; }
 
 .hero-info {
   position: absolute;

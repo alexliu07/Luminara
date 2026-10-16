@@ -1,6 +1,6 @@
 <script setup>
-import {ref, computed, onMounted, nextTick} from 'vue'
-import { convertFileSrc } from '@tauri-apps/api/core'
+import {ref, computed, onMounted, onActivated, nextTick} from 'vue'
+import { convertFileSrc, invoke } from '@tauri-apps/api/core'
 import { useRoute, useRouter } from 'vue-router'
 import { usePageScroller } from './scroll.js'
 import {getUnscraped, getWork, getWorks} from "./data.js";
@@ -12,6 +12,14 @@ const category = computed(() => decodeURIComponent(route.params.category))
 
 const works = ref([])
 const unscraped = ref([])
+const history = ref([])      // 继续观看：每部作品最近一集
+
+// 进度一直在变，不走 data.js 的缓存；KeepAlive 重新激活（从播放页返回）时也要重拉
+async function loadHistory() {
+  try { history.value = await invoke('list_continue_watching') }
+  catch (e) { console.error('加载继续观看失败', e) }
+}
+onActivated(loadHistory)
 
 onMounted(async () => {
   try {
@@ -26,7 +34,24 @@ onMounted(async () => {
 function onBack() {
   router.back()
 }
+// 观看时间：updated_at 是 SQLite 的 UTC 字符串，补 Z 后按本地时间显示
+function relTime(s) {
+  const t = Date.parse(s.replace(' ', 'T') + 'Z')
+  if (!t) return ''
+  const diff = (Date.now() - t) / 1000
+  if (diff < 60) return '刚刚'
+  if (diff < 3600) return `${Math.floor(diff / 60)} 分钟前`
+  if (diff < 86400) return `${Math.floor(diff / 3600)} 小时前`
+  if (diff < 86400 * 7) return `${Math.floor(diff / 86400)} 天前`
+  const d = new Date(t)
+  const p = (n) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+}
 function openDetail(w) {
+  if (w.file_id) {        // 继续观看条目：直接续播，不等作品详情
+    router.push(`/play/${w.kind}/${w.tmdb}/${w.file_id}`)
+    return
+  }
   if (!w.tmdb) return
   getWork(w.tmdb, w.kind)
   router.push(`/work/${w.kind}/${w.tmdb}`)
@@ -46,10 +71,29 @@ const items = computed(() => {
     cert: w.certification || '',
     overview: w.overview || '',
   })
+  // 继续观看：进度在历史表、海报简介在作品表，按 (kind, tmdb) 拼起来
+  const toContinue = (h) => {
+    const w = works.value.find(x => x.kind === h.kind && x.tmdb_id === h.tmdb_id)
+    const pos = h.duration > 0 ? Math.round(Math.min(1, h.position / h.duration) * 100) : 0
+    return {
+      key: 'c' + h.kind + h.tmdb_id,
+      tmdb: h.tmdb_id,
+      kind: h.kind,
+      file_id: h.file_id,
+      title: h.title || w?.title || '',
+      cover: w?.poster ? convertFileSrc(w.poster) : null,
+      rating: w?.rating ? w.rating.toFixed(1) : '',
+      ep: h.kind === 'tv' ? `第${h.season}季 第${h.episode}话` : '电影',
+      watched: pos > 0 ? `已看 ${pos}%` : '',
+      time: relTime(h.updated_at),
+      overview: w?.overview || '',
+    }
+  }
   switch (category.value) {
     case '电影': return works.value.filter(w => w.kind === 'movie').map(toRow)
     case '电视剧': return works.value.filter(w => w.kind === 'tv').map(toRow)
     case '动漫': return works.value.filter(w => (w.genres || []).includes('动画')).map(toRow)
+    case '继续观看': return history.value.map(toContinue)
     case '未刮削': return unscraped.value.map(u => ({
       key: 'f' + u.rel_path, tmdb: 0, title: u.name, cover: null,
       rating: '', date: '', seasons: '', country: '', cert: '', overview: u.rel_path,
@@ -89,7 +133,7 @@ const items = computed(() => {
               <svg class="ic ic-star"><use href="#i-star" /></svg>
               <span>{{ it.rating }}</span>
             </template>
-            <template v-for="(m, i) in [it.date, it.seasons, it.country, it.cert].filter(Boolean)" :key="m">
+            <template v-for="(m, i) in [it.ep, it.date, it.seasons, it.country, it.cert, it.watched, it.time].filter(Boolean)" :key="m">
               <i v-if="i || it.rating" class="sep"></i>
               <span :class="{ cert: m === it.cert }">{{ m }}</span>
             </template>

@@ -1,6 +1,7 @@
 // MKV 字幕窗口读取：Cues 定位 + HTTP Range，按时间窗只拉附近字幕块（边播边补）
 // 依赖容器的 SeekHead 与 CueRelativePosition（mkvmerge/makemkv 等常见 muxer 都有）；
 // 不满足时抛错，由调用方回退整文件提取
+// 压缩轨（ContentEncodings）在块级还原：algo 0=zlib 走 DecompressionStream，3=去头补字节
 
 const ID = {
     EBML: 0x1a45dfa3, SEGMENT: 0x18538067,
@@ -8,6 +9,8 @@ const ID = {
     INFO: 0x1549a966, TIMECODE_SCALE: 0x2ad7b1,
     TRACKS: 0x1654ae6b, TRACK_ENTRY: 0xae, TRACK_NUMBER: 0xd7, TRACK_TYPE: 0x83,
     CODEC_ID: 0x86, CODEC_PRIVATE: 0x63a2, LANGUAGE: 0x22b59c, NAME: 0x536e,
+    CONTENT_ENCODINGS: 0x6d80, CONTENT_ENCODING: 0x6240, CONTENT_COMPRESSION: 0x5034,
+    CONTENT_COMP_ALGO: 0x4254, CONTENT_COMP_SETTINGS: 0x4255,
     ATTACHMENTS: 0x1941a469, ATTACHED_FILE: 0x61a7, FILE_NAME: 0x466e, FILE_DATA: 0x465c,
     CUES: 0x1c53bb6b, CUE_POINT: 0xbb, CUE_TIME: 0xb3,
     CUE_TRACK_POSITIONS: 0xb7, CUE_TRACK: 0xf7, CUE_CLUSTER_POSITION: 0xf1, CUE_RELATIVE_POSITION: 0xf0,
@@ -59,6 +62,21 @@ function walk(buf, cb, from = 0, to = buf.length) {
 }
 function readStr(buf, e) {
     return dec.decode(buf.subarray(e.dataOff, e.dataOff + e.size)).replace(/\0+$/, '')
+}
+// ContentEncodings → t.comp / t.compSettings（对齐后端 mkv.rs 的 parse_content_encodings）
+function parseContentEncodings(buf, el, t) {
+    walk(buf, (e) => {
+        if (e.id !== ID.CONTENT_ENCODING) return
+        walk(buf, (c) => {
+            if (c.id !== ID.CONTENT_COMPRESSION) return
+            let algo = 0     // 缺省按规范为 zlib
+            walk(buf, (d) => {
+                if (d.id === ID.CONTENT_COMP_ALGO) algo = readUint(buf, d.dataOff, d.size)
+                else if (d.id === ID.CONTENT_COMP_SETTINGS) t.compSettings = buf.slice(d.dataOff, d.dataOff + d.size)
+            }, c.dataOff, c.dataOff + c.size)
+            t.comp = algo
+        }, e.dataOff, e.dataOff + e.size)
+    }, el.dataOff, el.dataOff + el.size)
 }
 
 // ---------- Range 读取（32KB 预读缓存） ----------
@@ -144,7 +162,8 @@ export async function openMkv(url) {
     const tracksEl = await readElementAt(r, segOff, tracksPos)
     walk(tracksEl.data, (e) => {
         if (e.id !== ID.TRACK_ENTRY) return
-        const t = { number: 0, type: 0, codec: '', lang: '', name: '', private: new Uint8Array() }
+        const t = { number: 0, type: 0, codec: '', lang: '', name: '', private: new Uint8Array(),
+                    comp: 0xff, compSettings: new Uint8Array() }
         walk(tracksEl.data, (c) => {
             if (c.id === ID.TRACK_NUMBER) t.number = readUint(tracksEl.data, c.dataOff, c.size)
             else if (c.id === ID.TRACK_TYPE) t.type = readUint(tracksEl.data, c.dataOff, c.size)
@@ -152,9 +171,11 @@ export async function openMkv(url) {
             else if (c.id === ID.CODEC_PRIVATE) t.private = tracksEl.data.slice(c.dataOff, c.dataOff + c.size)
             else if (c.id === ID.LANGUAGE) t.lang = readStr(tracksEl.data, c)
             else if (c.id === ID.NAME) t.name = readStr(tracksEl.data, c)
+            else if (c.id === ID.CONTENT_ENCODINGS) parseContentEncodings(tracksEl.data, c, t)
         }, e.dataOff, e.dataOff + e.size)
         if (t.type === 0x11) meta.tracks.push(t)
     })
+    meta.byNum = new Map(meta.tracks.map(t => [t.number, t]))
     // Cues → 块定位索引
     const cuesPos = seeks.get(ID.CUES)
     if (cuesPos != null) {
@@ -193,17 +214,39 @@ export async function openMkv(url) {
     return meta
 }
 
+// 块数据还原：0=zlib（每块独立、带 zlib 头，正好是 DecompressionStream('deflate') 的格式）
+// 3=去头压缩（把被剥掉的固定字节补回块首）；0xFF = 轨没有 ContentEncodings，原样返回
+async function decodeBlock(payload, track) {
+    if (!track || track.comp === 0xff) return payload
+    if (track.comp === 3) {
+        const s = track.compSettings
+        const out = new Uint8Array(s.length + payload.length)
+        out.set(s, 0)
+        out.set(payload, s.length)
+        return out
+    }
+    const stream = new Blob([payload]).stream().pipeThrough(new DecompressionStream('deflate'))
+    return new Uint8Array(await new Response(stream).arrayBuffer())
+}
+
 // 解析单个块元素（SimpleBlock 或 BlockGroup）→ { track, timeMs, durMs, text }
-function parseBlockEl(slice, cue, scale, nextMs) {
+async function parseBlockEl(slice, cue, scale, nextMs, byNum) {
     const el = readElem(slice, 0)
     const tMul = scale / 1e6
-    const make = (body, durUnits) => {
+    const make = async (body, durUnits) => {
         const [tn, tl] = readVint(body, 0)
         if (tl + 3 > body.length) return null
         if (body[tl + 2] & 0x06) return null        // 带 lacing 的不是文本字幕
         const durMs = durUnits != null ? durUnits * tMul
             : (nextMs != null ? Math.max(nextMs - cue.timeMs, 200) : 3000)
-        return { track: tn, timeMs: cue.timeMs, durMs, text: dec.decode(body.subarray(tl + 3)) }
+        let bytes
+        try {
+            bytes = await decodeBlock(body.subarray(tl + 3), byNum.get(tn))
+        } catch (e) {
+            console.warn('字幕块解压失败，跳过该块', e)   // 坏块不拖垮整窗
+            return null
+        }
+        return { track: tn, timeMs: cue.timeMs, durMs, text: dec.decode(bytes) }
     }
     if (el.id === ID.SIMPLE_BLOCK) return make(slice.subarray(el.dataOff, el.dataOff + el.size), null)
     if (el.id === ID.BLOCK_GROUP) {
@@ -260,7 +303,7 @@ export async function fetchWindow(meta, fromMs, toMs, trackNums) {
             if (need > 256 * 1024) continue
             const slice = off + need <= buf.length ? buf.subarray(off, off + need)
                 : await meta.reader.read(targets[k].abs, need)
-            const blk = parseBlockEl(slice, targets[k].c, meta.scale, nextTime.get(targets[k].c))
+            const blk = await parseBlockEl(slice, targets[k].c, meta.scale, nextTime.get(targets[k].c), meta.byNum)
             if (blk && blk.track === targets[k].c.track) out.push(blk)
         }
         i = j + 1

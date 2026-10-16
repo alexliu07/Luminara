@@ -140,6 +140,7 @@ struct SubtitleItem{
     track: Option<u32>,   // Some = mkv 内嵌轨号；None = 外挂字幕文件
     label: String,
     format: String,   // srt / vtt / ass / ssa
+    comp: u8,         // 内嵌轨 ContentCompAlgo：0=zlib 3=去头 0xFF=无压缩（外挂字幕恒 0xFF）
 }
 // 播放信息
 #[derive(Serialize)]
@@ -1262,7 +1263,7 @@ fn find_subtitles(db: &Connection, lib_id: i64, video_rel: &str)->Result<Vec<Sub
         if !["srt","vtt","ass","ssa"].contains(&ext.as_str()) { continue }
         let Some(sfx) = sname.strip_prefix(stem) else { continue };
         if !sfx.is_empty() && !sfx.starts_with('.') { continue }
-        out.push(SubtitleItem{ file_id: fid, track: None, label: subtitle_label(sfx, sfile), format: ext });
+        out.push(SubtitleItem{ file_id: fid, track: None, label: subtitle_label(sfx, sfile), format: ext, comp: 0xFF });
     }
     Ok(out)
 }
@@ -1309,6 +1310,25 @@ fn bin_cache_put(app: &tauri::AppHandle, file_id: i64, size: i64, track: u32, da
     let p = bin_cache_path(app, file_id, size, track);
     if let Some(d) = p.parent() { let _ = fs::create_dir_all(d); }
     let _ = fs::write(p, data);
+}
+// 清理已不在库里的文件留下的字幕缓存（.json/.sup 文件名都以 file_id 开头）；
+// 只改文件大小/挪了路径的同名文件不受影响——size 变了才会自然失效
+fn prune_sub_cache(app: &tauri::AppHandle) {
+    let Ok(db) = open_db(app) else { return };
+    let mut alive: HashSet<i64> = HashSet::new();
+    // 查不到文件列表就整个跳过，别把缓存全删了
+    let mut stmt = match db.prepare("SELECT id FROM files") { Ok(s) => s, Err(_) => return };
+    match stmt.query_map([], |r| r.get::<_, i64>(0)) {
+        Ok(rows) => for id in rows.flatten() { alive.insert(id); },
+        Err(_) => return,
+    }
+    let dir = app.path().app_data_dir().expect("配置目录不可用").join("sub_cache");
+    let Ok(entries) = fs::read_dir(&dir) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(id) = name.split('_').next().and_then(|s| s.parse::<i64>().ok()) else { continue };
+        if !alive.contains(&id) { let _ = fs::remove_file(e.path()); }
+    }
 }
 // 系统中文字体文件（给 ASS 渲染用）
 #[derive(Serialize)]
@@ -1379,6 +1399,7 @@ fn get_playback_info(app: tauri::AppHandle, file_id: i64)->Result<PlaybackInfo, 
                     track: Some(t.number),
                     label: mkv_subtitle_label(&t.lang, &t.name),
                     format: t.format().to_string(),
+                    comp: t.comp,
                 });
             },
             Err(e) => println!("内嵌字幕列轨失败 {}: {}", rel, e),   // 失败不拦播放
@@ -1520,6 +1541,113 @@ fn save_sub_cache(app: tauri::AppHandle, file_id: i64, texts: HashMap<u32, Strin
     Ok(())
 }
 
+// ==================== 字幕预缓存 ====================
+// 在线源经本地播放代理读，认证由代理处理
+fn proxy_url(file_id: i64) -> String {
+    format!("http://127.0.0.1:{}/dav/{}", proxy::port(), file_id)
+}
+// 待缓存清单：MKV 家族的视频（内嵌轨，本地+在线）+ 在线源的外挂字幕。
+// 已有缓存的跳过，所以重复点击是幂等的
+#[derive(Serialize)]
+struct CacheTarget{
+    file_id: i64,
+    name: String,
+    online: bool,   // 在线源要联网，前端据此提示耗时
+}
+#[tauri::command]
+fn list_cache_targets(app: tauri::AppHandle)->Result<Vec<CacheTarget>, String>{
+    let db = open_db(&app)?;
+    let dir = app.path().app_data_dir().expect("配置目录不可用").join("sub_cache");
+    let cached: HashSet<String> = fs::read_dir(&dir)
+        .map(|es| es.flatten().filter_map(|e| e.file_name().to_str().map(|s| s.to_string())).collect())
+        .unwrap_or_default();
+    let mut stmt = db.prepare(
+        "SELECT f.id, f.rel_path, f.size, s.source FROM files f JOIN sources s ON s.id = f.lib_id
+         WHERE (f.type = 'video' AND (f.rel_path LIKE '%.mkv' OR f.rel_path LIKE '%.mka' OR f.rel_path LIKE '%.webm'))
+            OR (f.type = 'subtitle' AND s.source = 1)
+         ORDER BY s.source DESC, f.rel_path").map_err(|e|e.to_string())?;
+    let rows = stmt.query_map([], |r| Ok((
+        r.get::<_,i64>(0)?, r.get::<_,String>(1)?, r.get::<_,i64>(2)?, r.get::<_,i32>(3)?,
+    ))).map_err(|e|e.to_string())?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (id, rel, size, source) = row.map_err(|e|e.to_string())?;
+        // 文本缓存 {id}_{size}.json / PGS 缓存 {id}_{size}_{track}.sup，任一存在就算缓存过
+        let base = format!("{}_{}", id, size);
+        let sup_prefix = format!("{}_", base);
+        if cached.contains(&format!("{}.json", base))
+            || cached.iter().any(|n| n.starts_with(&sup_prefix) && n.ends_with(".sup")) { continue }
+        out.push(CacheTarget{
+            file_id: id,
+            name: rel.rsplit('/').next().unwrap_or(&rel).to_string(),
+            online: source == 1,
+        });
+    }
+    Ok(out)
+}
+// 缓存单个文件的字幕：视频解容器（文本轨 + PGS 轨），字幕文件直接读原文
+#[tauri::command]
+async fn cache_subtitle(app: tauri::AppHandle, file_id: i64)->Result<u32, String>{
+    let row: Option<(String, i64, i32, String)> = {
+        let db = open_db(&app)?;
+        db.query_row(
+            "SELECT f.rel_path, f.size, s.source, s.data_a FROM files f JOIN sources s ON s.id = f.lib_id WHERE f.id = ?1",
+            params![file_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        ).optional().map_err(|e|e.to_string())?
+    };
+    let Some((rel, size, source, root)) = row else { return Err("文件不存在或已被删除".into()) };
+    // 读盘/联网都放 blocking 线程，别占着主线程（在线 MKV 可能跑很久）
+    tokio::task::spawn_blocking(move || -> Result<u32, String> {
+        let ext = rel.rsplit_once('.').map(|(_, e)| e.to_lowercase()).unwrap_or_default();
+        if SUB_EXT.contains(&ext.as_str()) {
+            let text = match source {
+                0 => decode_text(&fs::read(std::path::Path::new(&root).join(&rel)).map_err(|e|e.to_string())?),
+                1 => {
+                    let resp = reqwest::blocking::Client::builder()
+                        .timeout(std::time::Duration::from_secs(120))
+                        .build().map_err(|e|e.to_string())?
+                        .get(proxy_url(file_id)).send().map_err(|e|e.to_string())?;
+                    if !resp.status().is_success() {
+                        return Err(format!("下载失败（HTTP {}）", resp.status().as_u16()));
+                    }
+                    decode_text(&resp.bytes().map_err(|e|e.to_string())?)
+                }
+                _ => return Err("不支持的文件源类型".into()),
+            };
+            cache_put(&app, file_id, size, &HashMap::from([(0u32, text)]));   // 外挂字幕约定 track=0
+            return Ok(1);
+        }
+        let path = std::path::Path::new(&root).join(&rel).to_string_lossy().to_string();
+        // 先只列轨（便宜：本地 seek 到 Tracks 就停，在线只读文件头）：一条字幕轨都没有就写个
+        // 空标记收工，别为了一部没字幕的片子把整个容器解一遍 —— 库里这种文件最多
+        let head = match source {
+            0 => mkv::parse_local(&path, false),
+            1 => mkv::parse_http(&proxy_url(file_id), false),
+            _ => return Err("不支持的文件源类型".into()),
+        }?;
+        if !head.tracks.iter().any(|t| t.is_text() || t.is_pgs()) {
+            cache_put(&app, file_id, size, &HashMap::new());   // 空标记：已处理过
+            return Ok(0);
+        }
+        let parsed = match source {
+            0 => mkv::parse_local(&path, true),
+            1 => mkv::parse_http(&proxy_url(file_id), true),
+            _ => return Err("不支持的文件源类型".into()),
+        }?;
+        let mut n = 0u32;
+        let texts = parsed.build_texts();
+        n += texts.len() as u32;
+        // 有字幕轨才落盘（文本轨即使解出空串也写），标记「解过了」
+        cache_put(&app, file_id, size, &texts);
+        for t in parsed.tracks.iter().filter(|t| t.is_pgs()) {
+            let sup = parsed.build_sup(t.number);
+            if !sup.is_empty() { bin_cache_put(&app, file_id, size, t.number, &sup); n += 1; }
+        }
+        Ok(n)
+    }).await.map_err(|e| e.to_string())?
+}
+
 // ==================== 观看历史 ====================
 // 记录播放进度：按 (tmdb_id, kind) upsert，每部作品只留最近一集
 #[tauri::command]
@@ -1591,6 +1719,14 @@ fn list_continue_watching(app: tauri::AppHandle)->Result<Vec<ContinueItem>, Stri
     }
     Ok(out)
 }
+// 删除一部作品的观看记录：从「继续观看」里移除，顺带丢掉续播位置
+#[tauri::command]
+fn delete_progress(app: tauri::AppHandle, tmdb: i64, kind: String)->Result<(), String>{
+    let db = open_db(&app)?;
+    db.execute("DELETE FROM watch_history WHERE tmdb_id = ?1 AND kind = ?2",
+               params![tmdb, kind]).map_err(|e|e.to_string())?;
+    Ok(())
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -1603,9 +1739,10 @@ pub fn run() {
                 Ok(port) => println!("播放代理监听 127.0.0.1:{}", port),
                 Err(e) => println!("[播放代理] 启动失败：{}", e),
             }
+            prune_sub_cache(app.handle());
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work, get_playback_info, get_subtitle_text, get_subtitle_bin, peek_sub_cache, save_sub_cache, get_cjk_fonts, update_progress, get_resume, list_continue_watching])
+        .invoke_handler(tauri::generate_handler![add_local_source, list_sources, delete_source, index_local_source, add_webdav_source, test_webdav_source, index_webdav_source, list_files, get_setting, set_setting, list_works, list_unscraped, get_work, get_playback_info, get_subtitle_text, get_subtitle_bin, peek_sub_cache, save_sub_cache, get_cjk_fonts, update_progress, get_resume, list_continue_watching, delete_progress, list_cache_targets, cache_subtitle])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

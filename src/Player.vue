@@ -60,7 +60,8 @@ async function loadEmbedded() {
       const texts = {}
       for (const t of tracks) {
         const s = subs.value.find(x => x.track === t.metadata.trackNumber)
-        if (!s || s.format === 'pgs') continue   // extractor 对 PGS 输出乱码，走 get_subtitle_bin
+        // extractor 不认 PGS，也不认 ContentEncodings 压缩轨（都会吐乱码）：分别走 get_subtitle_bin 和后端提取
+        if (!s || s.format === 'pgs' || s.encoded) continue
         const text = new TextDecoder().decode(t.output.subtitle)
         setText(s, text)
         texts[t.metadata.trackNumber] = text
@@ -72,17 +73,16 @@ async function loadEmbedded() {
   return extractPromise
 }
 
-// 内嵌轨取文本：缓存 → Range 提取（快、带字体）→ 失败回退后端提取
+// 内嵌轨取文本：Range 提取（快、带字体）→ 失败回退后端整容器提取
+// 压缩轨（ContentEncodings）extractor 不认，跳过提取直接走后端——那边按 ContentCompAlgo 解压
 async function fetchEmbeddedText(s) {
-  try {
-    const cached = await invoke('peek_sub_cache', { fileId: s.file_id, track: s.track })
-    if (cached != null) { setText(s, cached); return }
-  } catch {}
-  try {
-    await loadEmbedded()
-    if (s.text != null) return
-  } catch (e) {
-    console.error('Range 提取失败，回退后端提取', e)
+  if (!s.encoded) {
+    try {
+      await loadEmbedded()
+      if (s.text != null) return
+    } catch (e) {
+      console.error('Range 提取失败，回退后端提取', e)
+    }
   }
   setText(s, await invoke('get_subtitle_text', { fileId: s.file_id, track: s.track }))
 }
@@ -100,6 +100,8 @@ async function startStream(s, v) {
   const meta = await mkvMeta.get(s.file_id)
   const t = meta.tracks.find(x => x.number === s.track)
   if (!t) throw new Error('内嵌轨不存在')
+  // 压缩轨要靠 DecompressionStream 还原文案，环境不支持就早抛，让调用方回退后端
+  if (t.comp !== 0xff && typeof DecompressionStream === 'undefined') throw new Error('当前环境不支持解压字幕轨')
   const st = { loadedUntil: 0, busy: false, pushed: new Set(), cues: [], render: null }
   streamState.set(s.file_id + ':' + s.track, st)   // 新渲染器换新状态，旧推送作废
   if (s.format === 'ass' || s.format === 'ssa') {
@@ -159,7 +161,7 @@ function onTimeUpdate() {
   const i = activeSub.value
   if (i < 0) return
   const s = subs.value[i]
-  if (!s || s.track == null || s.windowed === false) return
+  if (!s || s.track == null || s.noStream) return
   const st = streamState.get(s.file_id + ':' + s.track)
   if (!st || st.busy) return
   const nowMs = (video.value?.currentTime || 0) * 1000
@@ -239,7 +241,8 @@ onMounted(async () => {
     resumeAt = resume || 0
     const list = []
     for (const s of p.subtitles) {
-      if (s.track != null) { list.push({ ...s, text: null, blobUrl: null }); continue }  // 内嵌轨选中时才提取
+      // 内嵌轨选中时才提取；comp≠0xFF 是 ContentEncodings 压缩轨，前端只有流式那条路能解
+      if (s.track != null) { list.push({ ...s, encoded: s.comp !== 0xFF, text: null, blobUrl: null }); continue }
       try {
         const text = await invoke('get_subtitle_text', { fileId: s.file_id, track: s.track })
         const vtt = s.format === 'srt' ? srtToVtt(text) : s.format === 'vtt' ? text : null
@@ -309,11 +312,12 @@ async function applySub() {
     return
   }
   // 内嵌轨：命中缓存秒开，否则时间窗流式（边播边补）；容器不支持时回退整文件提取
-  if (s.track != null && s.windowed !== false) {
+  // noStream 一旦置位就不再试流式（undefined=还没试过）
+  if (s.track != null && !s.noStream) {
     let cached = null
     try { cached = await invoke('peek_sub_cache', { fileId: s.file_id, track: s.track }) } catch {}
     if (cached != null) {
-      s.windowed = false
+      s.noStream = true
       setText(s, cached)
     } else {
       try {
@@ -321,7 +325,7 @@ async function applySub() {
         return
       } catch (e) {
         console.warn('窗口流式加载不可用，回退整文件提取', e)
-        s.windowed = false
+        s.noStream = true
       }
     }
   }
