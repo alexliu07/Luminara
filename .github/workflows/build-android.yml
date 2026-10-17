@@ -57,7 +57,7 @@ jobs:
 
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --install \
-            "platforms;android-37" \
+            "platforms;android-36" \
             "build-tools;36.0.0" \
             "ndk;${NDK_VERSION}"
 
@@ -103,6 +103,9 @@ jobs:
 
           p = Path("src-tauri/gen/android/app/build.gradle.kts")
           s = p.read_text()
+          # runner 仓库还没有 API 37，降到 36；targetSdk 不能高于 compileSdk
+          s = s.replace("compileSdk = 37", "compileSdk = 36")
+          s = s.replace("targetSdk = 37", "targetSdk = 36")
 
           if "import java.util.Properties" not in s:
               s = "import java.util.Properties\n" + s
