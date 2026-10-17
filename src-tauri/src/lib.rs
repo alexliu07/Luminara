@@ -932,17 +932,26 @@ async fn cache_images(app: tauri::AppHandle)->Result<u32, String>{
 // 添加本地文件源
 #[tauri::command]
 async fn add_local_source(app: tauri::AppHandle)->Result<Option<i64>, String>{
-    let picked = app.dialog().file().set_title("选择媒体文件夹").blocking_pick_folder();
-    let Some(folder) = picked else {
-        return Ok(None);
-    };
-    let path = folder.simplified().into_path().map_err(|e|e.to_string())?;
-    let path_str = path.to_string_lossy().to_string();
-    let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path_str.clone());
-    let db = open_db(&app)?;
-    db.execute("INSERT OR IGNORE INTO sources (source,name,data_a) VALUES (0,?1,?2)",params![name,path_str]).map_err(|e|e.to_string())?;
-    let id: i64 = db.query_row("SELECT id FROM sources WHERE data_a = ?1", params![path_str], |r| r.get(0)).map_err(|e|e.to_string())?;
-    Ok(Some(id))
+    // 文件夹选择器只有桌面端提供；移动端用 WebDAV 源
+    #[cfg(mobile)]
+    {
+        let _ = app;
+        Err("移动端暂不支持添加本地文件夹，请使用 WebDAV 文件源".to_string())
+    }
+    #[cfg(desktop)]
+    {
+        let picked = app.dialog().file().set_title("选择媒体文件夹").blocking_pick_folder();
+        let Some(folder) = picked else {
+            return Ok(None);
+        };
+        let path = folder.simplified().into_path().map_err(|e| e.to_string())?;
+        let path_str = path.to_string_lossy().to_string();
+        let name = path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path_str.clone());
+        let db = open_db(&app)?;
+        db.execute("INSERT OR IGNORE INTO sources (source,name,data_a) VALUES (0,?1,?2)", params![name,path_str]).map_err(|e| e.to_string())?;
+        let id: i64 = db.query_row("SELECT id FROM sources WHERE data_a = ?1", params![path_str], |r| r.get(0)).map_err(|e|e.to_string())?;
+        Ok(Some(id))
+    }
 }
 // 展示文件源列表
 #[tauri::command]
